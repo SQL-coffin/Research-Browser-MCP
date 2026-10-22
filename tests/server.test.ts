@@ -147,6 +147,46 @@ describe("MCP surface", () => {
     }
   });
 
+  it("classifies a fetched page by reference exactly as the fetch did, markup and Retry-After included", async () => {
+    const fixture = http.createServer((req, res) => {
+      if (req.url === "/captcha") {
+        // Only the markup identifies this challenge; the extracted text does not.
+        res.writeHead(200, { "content-type": "text/html" });
+        res.end('<title>Welcome</title><div class="g-recaptcha" data-sitekey="k"></div><p>Loading</p>');
+      } else {
+        res.writeHead(429, { "content-type": "text/html", "retry-after": "7" });
+        res.end("slow down");
+      }
+    });
+    await new Promise<void>((r) => fixture.listen(0, "127.0.0.1", r));
+    const port = (fixture.address() as AddressInfo).port;
+    try {
+      const local = await connect({
+        fetchPolicy: {
+          ...DEFAULT_FETCH_POLICY,
+          allowedSchemes: new Set(["http:"]),
+          allowedPorts: new Set([port]),
+          allowedHosts: parseHostAllowlist("fixture.test"),
+          isAddressAllowed: (ip) => (ip === "127.0.0.1" ? ({ allowed: true } as const) : classifyAddress(ip)),
+        },
+        fetchDeps: loopbackDeps,
+      });
+      for (const [path, type] of [
+        ["/captcha", "captcha"],
+        ["/busy", "rate_limited"],
+      ] as const) {
+        const fetched = await local.call("research.fetch_public_page", { url: `http://fixture.test:${port}${path}` });
+        assert.equal(fetched.challenge_type, type, path);
+        const byReference = await local.call("research.inspect_challenge", { fetch_request_id: fetched.request_id });
+        const { source_url: _origin, status: _status, ...classification } = byReference;
+        assert.deepEqual(classification, fetched.challenge, `${path}: the reference must report what the fetch observed`);
+      }
+    } finally {
+      fixture.closeAllConnections();
+      fixture.close();
+    }
+  });
+
   it("pauses with only the origin and defers resume to the host", async () => {
     const p = await call("research.pause_for_human", {
       task_id: "t1",

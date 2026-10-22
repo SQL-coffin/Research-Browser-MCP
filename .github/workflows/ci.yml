@@ -45,7 +45,10 @@ jobs:
         run: npm run build
 
       - name: Smoke-test dist over stdio (loopback-only network namespace)
-        # Starts the built dist/index.js and drives it with the MCP SDK's
-        # StdioClientTransport: initialize, tools/list and default-deny fetches.
-        # Every child process is time-limited and killed, even when a test fails.
+        # Tests the built dist/ only:
+        # - starts dist/index.js and drives it with the MCP SDK's StdioClientTransport
+        #   (initialize, tools/list, default-deny fetches); every child process is
+        #   time-limited and killed, even when a test fails;
+        # - runs the compiled fetch path and MCP result handling against local
+        #   HTTP/HTTPS fixtures.
         run: unshare --map-root-user --net bash -c 'ip link set lo up && npm run test:smoke'

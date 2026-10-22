@@ -16,6 +16,7 @@ import {
   parseHostAllowlist,
   redactUrl,
   type ChallengeObservation,
+  type ChallengeResult,
   type UrlDisclosure,
 } from "./security.js";
 
@@ -70,12 +71,14 @@ export function createServer(opts: ServerOptions = {}): McpServer {
   const providers = opts.providers ?? new ProviderRegistry();
   const handoff = opts.handoff ?? new HandoffStore();
 
-  // Recent fetch observations so inspect_challenge can take a fetch reference
-  // instead of the caller re-supplying page content.
-  const recent = new Map<string, ChallengeObservation & { source_url: string }>();
+  // The last 100 fetch classifications, so inspect_challenge can take a fetch
+  // reference. Each keeps the classification the fetch made from the full
+  // response (status, headers, markup) and the origin; no page content. Classifying
+  // again from extracted text would lose markup markers and Retry-After.
+  const recent = new Map<string, { source_url: string; challenge: ChallengeResult }>();
   const remember = (r: FetchResult) => {
-    if (!("http_status" in r)) return;
-    recent.set(r.request_id, { source_url: redactUrl(r.final_url, "origin"), httpStatus: r.http_status, ...(r.title ? { title: r.title } : {}), body: r.extracted_text.slice(0, 20_000) });
+    if (!("challenge" in r)) return;
+    recent.set(r.request_id, { source_url: redactUrl(r.final_url, "origin"), challenge: r.challenge });
     while (recent.size > 100) recent.delete(recent.keys().next().value!);
   };
 
@@ -129,21 +132,19 @@ export function createServer(opts: ServerOptions = {}): McpServer {
       },
     },
     async ({ fetch_request_id, observation }) => {
-      let obs: (ChallengeObservation & { source_url: string }) | undefined;
-      if (fetch_request_id) obs = recent.get(fetch_request_id);
-      else if (observation) {
-        obs = {
-          source_url: redactUrl(observation.source_url, "origin"),
+      if (fetch_request_id) {
+        const seen = recent.get(fetch_request_id);
+        if (seen) return asContent({ status: "success", source_url: seen.source_url, ...seen.challenge });
+      } else if (observation) {
+        const obs: ChallengeObservation = {
           httpStatus: observation.http_status,
           ...(observation.title ? { title: observation.title } : {}),
           ...(observation.text_excerpt ? { body: observation.text_excerpt } : {}),
           ...(observation.retry_after ? { headers: { "retry-after": observation.retry_after } } : {}),
         };
+        return asContent({ status: "success", source_url: redactUrl(observation.source_url, "origin"), ...classifyChallenge(obs) });
       }
-      if (!obs) {
-        return asContent({ status: "invalid_input", error: { code: "missing_observation", message: "Provide a known fetch_request_id or an observation", retryable: false } });
-      }
-      return asContent({ status: "success", source_url: obs.source_url, ...classifyChallenge(obs) });
+      return asContent({ status: "invalid_input", error: { code: "missing_observation", message: "Provide a known fetch_request_id or an observation", retryable: false } });
     },
   );
 

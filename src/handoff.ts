@@ -215,7 +215,8 @@ export class HandoffStore {
         "This service will not solve CAPTCHAs, sign in, or bypass access controls. " +
         "The person may verify and continue, choose an alternate public source, or cancel. Access is not guaranteed after verification.",
       data_retained:
-        "Held in memory until the resume handle expires or is evicted: task_id, pause_id, reason, timestamps, policy version, " +
+        "Held in memory only, at most 1,000 records; a record stops working when its resume handle expires and is dropped " +
+        "the next time a task is paused or when the process exits: task_id, pause_id, reason, timestamps, policy version, " +
         "the URL's origin (scheme, host and port only) and an HMAC-SHA256 of the full canonical URL under a per-store random key, " +
         "used only to match the host's event. Not retained: the raw URL, its path, query, fragment and credentials, " +
         "completed_steps, next_step, cookies and page content.",

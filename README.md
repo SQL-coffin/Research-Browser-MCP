@@ -25,7 +25,7 @@ Implemented:
   - idempotency.
 
   Any rejection leaves the task `BLOCKED` and the pause unconsumed. Pause records never keep the raw URL. They keep its origin and an HMAC of the canonical URL; event URLs are compared against that HMAC.
-- `src/search.ts` — provider allowlist from startup configuration only. No provider is enabled by default.
+- `src/search.ts` — a provider registry fixed when the server is constructed; tool input cannot add a provider. The shipped server registers none and has no setting to enable one, so `research.search` answers `provider_unavailable`.
 
 ### Configuration
 
@@ -83,6 +83,15 @@ For hosts listed in `RESEARCH_BROWSER_FULL_URL_HOSTS`, `fetch_public_page` resul
 
 > **No general-purpose program can reliably tell which path segments or parameter values are secrets.** Masking secret-looking parameter names is a heuristic. Listing a host in `RESEARCH_BROWSER_FULL_URL_HOSTS` means you knowingly accept that a token, session ID or other secret in that host's URLs may appear in results, and in anything that stores or forwards them.
 
+### What is kept in memory
+
+The service writes no files, and everything below is lost when the process exits. Its audit log lines go to stderr, which the MCP client may store.
+
+- **Handoff records**: at most 1,000. Each holds the task and pause IDs, the challenge reason, timestamps, the policy version, the URL's origin and an HMAC of the full URL. A record stops working when its resume handle expires (1 hour by default). It is removed from memory the next time a task is paused, or when the process exits.
+- **The last 100 fetch classifications**, so `inspect_challenge` can take a `fetch_request_id`. Each holds the request ID, the origin and the challenge classification made from the full response. Page content is not kept.
+
+Page content and URLs are returned to the caller and not kept after the request finishes. Response headers are only used to classify challenges.
+
 Development uses npm (`package-lock.json`) and **Node.js 22 only**: `engines` (`^22`), `.nvmrc`, `@types/node` 22.x and CI all target the same line.
 
 ```bash
@@ -90,7 +99,7 @@ npm ci
 npm run typecheck   # strict tsc over src/ and tests/, no emit
 npm test            # node:test against local HTTP/HTTPS fixtures; no third-party sites
 npm run build
-npm run test:smoke  # starts dist/index.js and talks to it over stdio
+npm run test:smoke  # tests the built dist/: stdio smoke test, and fetches against local fixtures
 RESEARCH_BROWSER_ALLOWED_HOSTS="example.org" npm start
 ```
 
@@ -102,8 +111,8 @@ Known gaps:
 - For hosts opted in to full URLs, results show paths and the values of innocuously named query parameters. Origin-only output is the default precisely because no program can find every secret there.
 - Event times are compared with zero clock-skew tolerance, so the host's and this service's clocks must agree.
 - The DNS-rebinding tests use an injected resolver and loopback fixtures. They have not been run in a controlled network sandbox with a real authoritative DNS server.
-- No durable evidence sink: results report `evidence_persisted: false`. Handoff records are in memory only.
-- No search provider is enabled. Robots.txt is not consulted yet.
+- No durable evidence sink: results report `evidence_persisted: false`. Handoff records and the classification cache are in memory only (see above).
+- No search provider is enabled by default, and none ships with this repository; `research.search` answers `provider_unavailable`. Robots.txt is not consulted yet.
 - Text extraction is regex-based and is not a full HTML parser.
 
 ### Continuous integration
@@ -114,17 +123,25 @@ Known gaps:
 2. `npm run typecheck` runs strict TypeScript over `src/` and `tests/`.
 3. `npm test` runs the full suite inside a fresh network namespace that only has loopback, so a test that tries to reach a real host fails instead of passing. With `CI` set, the HTTPS tests, including the zero-byte ClientHello regression, cannot be skipped: a missing `openssl` fails the run.
 4. `npm run build` compiles to `dist/`.
-5. `npm run test:smoke` starts the built `dist/index.js` with the MCP SDK's `StdioClientTransport`, also inside the loopback-only namespace. It checks that:
-   - `initialize` and `tools/list` succeed and all five tools are listed;
-   - fetching is denied by default;
-   - both host lists are read from the environment, and the full-URL list changes only how URLs are shown;
-   - a server with a wildcard in either list refuses to start.
+5. `npm run test:smoke` tests the built `dist/` only, also inside the loopback-only namespace.
+   - `tests/smoke/dist-stdio.test.ts` starts `dist/index.js` with the MCP SDK's `StdioClientTransport` and checks that:
+     - `initialize` and `tools/list` succeed and all five tools are listed;
+     - fetching is denied by default;
+     - both host lists are read from the environment, and the full-URL list changes only how URLs are shown;
+     - a server with a wildcard in either list refuses to start.
 
-   Every request has a timeout. Every child process is stopped (stdin EOF, then SIGTERM, then SIGKILL) and verified gone, even when a test fails.
+     Every request has a timeout. Every child process is stopped (stdin EOF, then SIGTERM, then SIGKILL) and verified gone, even when a test fails.
+   - `tests/smoke/dist-fetch.test.ts` imports the compiled `dist/fetcher.js` and `dist/index.js` and fetches from local HTTP and HTTPS fixtures. It covers:
+     - redirects, gzip, extraction and hashing;
+     - origin-only and opted-in URLs;
+     - the peer check, the TLS certificate check, and refused redirects;
+     - MCP result handling, including `inspect_challenge` by reference.
+
+     The fixtures are reached through the same parameters the unit tests inject. A test checks that the policy `dist/index.js` builds from its environment refuses them.
 
 CI does not check the following:
 
-- A real page fetch through `dist/`: no allowlisted host is reachable from the namespace.
+- A fetch from a real third-party site: `dist/` is only exercised against local fixtures.
 - Node.js versions other than 22, which `engines` does not claim to support.
 - Lint or formatting, a dependency audit, or runs on pushes to `main`.
 
