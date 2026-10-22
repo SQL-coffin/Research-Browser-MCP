@@ -490,7 +490,8 @@ export async function fetchPublicPage(rawUrl: string, policy: FetchPolicy = DEFA
       if (status !== "success") {
         result.error = toolError(status, challenge.challenge_type === "none" ? `http_${httpStatus}` : challenge.challenge_type, challenge.recommended_action);
       }
-      deps.log({ event: "fetch", request_id: requestId, url: redactUrl(rawUrl, "log"), final_url: redactUrl(key, "log"), status, http_status: httpStatus, peer, redirects: redirectChain.length, duration_ms: Date.now() - started });
+      // Logs carry origins only: a path or query can hold a secret, and request_id ties the line to the full result.
+      deps.log({ event: "fetch", request_id: requestId, origin: redactUrl(rawUrl, "origin"), final_origin: redactUrl(key, "origin"), status, http_status: httpStatus, peer, redirects: redirectChain.length, duration_ms: Date.now() - started });
       return result;
     }
   } catch (err) {
@@ -500,7 +501,7 @@ export async function fetchPublicPage(rawUrl: string, policy: FetchPolicy = DEFA
     else if (err instanceof Error && "code" in err && typeof err.code === "string" && /^(ERR_TLS|CERT_|UNABLE_TO|DEPTH_ZERO|SELF_SIGNED|ERR_SSL)/.test(err.code)) {
       stop = new FetchStop("policy_denied", "tls_verification_failed", "TLS certificate verification failed");
     } else stop = new FetchStop("provider_unavailable", "connection_failed", "Connection to the destination failed");
-    deps.log({ event: "fetch", request_id: requestId, url: redactUrl(rawUrl, "log"), status: stop.status, code: stop.code, redirects: redirectChain.length, duration_ms: Date.now() - started });
+    deps.log({ event: "fetch", request_id: requestId, origin: redactUrl(rawUrl, "origin"), status: stop.status, code: stop.code, redirects: redirectChain.length, duration_ms: Date.now() - started });
     return { ...base(), status: stop.status, error: toolError(stop.status, stop.code, stop.message) };
   } finally {
     clearTimeout(deadline);

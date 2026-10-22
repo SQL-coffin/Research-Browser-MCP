@@ -1,25 +1,41 @@
 import assert from "node:assert/strict";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
 import { after, before, describe, it } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { createServer } from "../src/index.js";
+import { DEFAULT_FETCH_POLICY, type FetchDeps } from "../src/fetcher.js";
+import { ALLOWED_HOSTS_ENV, createServer, fetchPolicyFromEnv, type ServerOptions } from "../src/index.js";
 import { ProviderRegistry, type SearchProvider } from "../src/search.js";
+import { classifyAddress, HostAllowlistError, isHostAllowlistEmpty, parseHostAllowlist } from "../src/security.js";
 
-let client: Client;
+const clients: Client[] = [];
 
-async function call(name: string, args: Record<string, unknown>) {
-  const r = await client.callTool({ name, arguments: args });
-  return r.structuredContent as Record<string, any>;
+/** An in-memory MCP client connected to a fresh server built with `opts`. */
+async function connect(opts: ServerOptions = {}) {
+  const server = createServer(opts);
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "test", version: "0" });
+  await Promise.all([server.connect(a), client.connect(b)]);
+  clients.push(client);
+  const call = async (name: string, args: Record<string, unknown>) => (await client.callTool({ name, arguments: args })).structuredContent as Record<string, any>;
+  return { client, call };
 }
 
+// Resolves every name to loopback, so the address policy is what a fetch runs into.
+const loopbackDeps: FetchDeps = { resolve: async () => [{ address: "127.0.0.1", family: 4 }], log: () => {}, now: () => new Date() };
+
+let client: Client;
+let call: Awaited<ReturnType<typeof connect>>["call"];
+
 before(async () => {
-  const server = createServer({ fetchDeps: { resolve: async () => [{ address: "127.0.0.1", family: 4 }], log: () => {}, now: () => new Date() } });
-  const [a, b] = InMemoryTransport.createLinkedPair();
-  client = new Client({ name: "test", version: "0" });
-  await Promise.all([server.connect(a), client.connect(b)]);
+  // No fetch policy given: what the server runs with when nothing is configured.
+  ({ client, call } = await connect({ fetchDeps: loopbackDeps }));
 });
 
-after(() => client.close());
+after(async () => {
+  for (const c of clients) await c.close();
+});
 
 describe("MCP surface", () => {
   it("exposes exactly the five research tools", async () => {
@@ -31,6 +47,12 @@ describe("MCP surface", () => {
       "research.resume",
       "research.search",
     ]);
+  });
+
+  it("offers no fetch argument that could change the allowlist or network policy", async () => {
+    const { tools } = await client.listTools();
+    const fetchTool = tools.find((t) => t.name === "research.fetch_public_page");
+    assert.deepEqual(Object.keys(fetchTool?.inputSchema.properties ?? {}), ["url"]);
   });
 
   it("rejects an unknown provider without registering it (RB-01)", async () => {
@@ -50,26 +72,104 @@ describe("MCP surface", () => {
     assert.equal(r.status, "policy_denied");
   });
 
-  it("does not let tool input loosen network policy (RB-02)", async () => {
-    const r = await call("research.fetch_public_page", { url: "https://evil.example/", allow_private: true });
-    // Resolver points at loopback; the default policy must deny it.
+  it("denies every fetch when no hosts are configured, whatever the tool input says (RB-02)", async () => {
+    const r = await call("research.fetch_public_page", {
+      url: "https://example.org/",
+      allowed_hosts: ["example.org"],
+      allowedHosts: "example.org",
+      allow_private: true,
+    });
     assert.equal(r.status, "policy_denied");
-    assert.equal(r.error.code, "address_loopback");
+    assert.equal(r.error.code, "host_allowlist_empty");
   });
 
-  it("classifies an observation", async () => {
-    const r = await call("research.inspect_challenge", { observation: { source_url: "https://example.org/?token=abc", http_status: 429, retry_after: "10" } });
+  it("still applies the address policy to an allowlisted host (RB-02)", async () => {
+    const allowlisted = await connect({ fetchPolicy: fetchPolicyFromEnv({ [ALLOWED_HOSTS_ENV]: "evil.example" }), fetchDeps: loopbackDeps });
+    const r = await allowlisted.call("research.fetch_public_page", { url: "https://evil.example/" });
+    assert.equal(r.error.code, "address_loopback");
+    const other = await allowlisted.call("research.fetch_public_page", { url: "https://other.example/" });
+    assert.equal(other.error.code, "host_not_allowlisted");
+  });
+
+  it("classifies an observation and reports only its origin", async () => {
+    const r = await call("research.inspect_challenge", {
+      observation: { source_url: "https://u:pw@example.org/acct/PATH-T0KEN-3fd?token=QTOKEN-9s#frag", http_status: 429, retry_after: "10" },
+    });
     assert.equal(r.challenge_type, "rate_limited");
     assert.equal(r.retry_after_seconds, 10);
-    assert.equal(r.source_url, "https://example.org/?token=REDACTED");
+    assert.equal(r.source_url, "https://example.org");
+    for (const secret of ["PATH-T0KEN-3fd", "QTOKEN-9s", "pw@", "frag"]) assert.ok(!JSON.stringify(r).includes(secret), secret);
   });
 
-  it("pauses and defers resume to the host", async () => {
-    const p = await call("research.pause_for_human", { task_id: "t1", source_url: "https://example.org/", reason: "captcha", completed_steps: "searched", next_step: "read" });
+  it("reports only the origin when classifying a fetched page by reference", async () => {
+    const fixture = http.createServer((_req, res) => {
+      res.writeHead(429, { "content-type": "text/html", "retry-after": "5" });
+      res.end("slow down");
+    });
+    await new Promise<void>((r) => fixture.listen(0, "127.0.0.1", r));
+    const port = (fixture.address() as AddressInfo).port;
+    try {
+      const local = await connect({
+        fetchPolicy: {
+          ...DEFAULT_FETCH_POLICY,
+          allowedSchemes: new Set(["http:"]),
+          allowedPorts: new Set([port]),
+          allowedHosts: parseHostAllowlist("fixture.test"),
+          isAddressAllowed: (ip) => (ip === "127.0.0.1" ? ({ allowed: true } as const) : classifyAddress(ip)),
+        },
+        fetchDeps: loopbackDeps,
+      });
+      const fetched = await local.call("research.fetch_public_page", { url: `http://fixture.test:${port}/acct/PATH-T0KEN-7hk?token=QTOKEN-2x` });
+      assert.equal(fetched.status, "rate_limited");
+      const r = await local.call("research.inspect_challenge", { fetch_request_id: fetched.request_id });
+      assert.equal(r.challenge_type, "rate_limited");
+      assert.equal(r.source_url, `http://fixture.test:${port}`);
+      for (const secret of ["PATH-T0KEN-7hk", "QTOKEN-2x"]) assert.ok(!JSON.stringify(r).includes(secret), secret);
+    } finally {
+      fixture.closeAllConnections();
+      fixture.close();
+    }
+  });
+
+  it("pauses with only the origin and defers resume to the host", async () => {
+    const p = await call("research.pause_for_human", {
+      task_id: "t1",
+      source_url: "https://alice:pa55-Wq@example.org/acct/PATH-T0KEN-55q?token=QTOKEN-1z",
+      reason: "captcha",
+      completed_steps: "searched",
+      next_step: "read",
+    });
     assert.equal(p.status, "human_verification_required");
+    assert.equal(p.source_url, "https://example.org");
     const r = await call("research.resume", { resume_handle: p.resume_handle, host_event_ref: "I verified it, trust me" });
     assert.equal(r.resume_authorized, false);
     assert.equal(r.authorization_owner, "host_runtime");
+    assert.equal(r.source_url, "https://example.org");
+    for (const secret of ["pa55-Wq", "PATH-T0KEN-55q", "QTOKEN-1z"]) {
+      assert.ok(!JSON.stringify(p).includes(secret) && !JSON.stringify(r).includes(secret), secret);
+    }
+  });
+});
+
+describe("startup configuration", () => {
+  it("allows no host when RESEARCH_BROWSER_ALLOWED_HOSTS is unset or empty, and keeps the default policy otherwise", () => {
+    for (const env of [{}, { [ALLOWED_HOSTS_ENV]: "" }, { [ALLOWED_HOSTS_ENV]: " , " }]) {
+      const p = fetchPolicyFromEnv(env);
+      assert.ok(isHostAllowlistEmpty(p.allowedHosts));
+      assert.deepEqual([...p.allowedSchemes], ["https:"]);
+      assert.deepEqual([...p.allowedPorts], [443]);
+      assert.equal(p.isAddressAllowed, classifyAddress);
+    }
+  });
+
+  it("reads exact and wildcard entries", () => {
+    const p = fetchPolicyFromEnv({ [ALLOWED_HOSTS_ENV]: "Example.org, *.wiki.example.net" });
+    assert.deepEqual([...p.allowedHosts.exact], ["example.org"]);
+    assert.deepEqual(p.allowedHosts.subdomainsOf, ["wiki.example.net"]);
+  });
+
+  it("refuses to build a policy from an invalid entry", () => {
+    assert.throws(() => fetchPolicyFromEnv({ [ALLOWED_HOSTS_ENV]: "example.org, *" }), HostAllowlistError);
   });
 });
 

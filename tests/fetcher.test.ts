@@ -18,7 +18,7 @@ import {
   type FetchResult,
   type ResolvedAddress,
 } from "../src/fetcher.js";
-import { classifyAddress, validateUrl } from "../src/security.js";
+import { classifyAddress, parseHostAllowlist, validateUrl } from "../src/security.js";
 
 // ---------------------------------------------------------------------------
 // Local fixture server. The fetcher treats 127.0.0.1 as the ONLY "public"
@@ -33,11 +33,16 @@ let port: number;
 
 const fixtureOnly = (ip: string) => (ip === "127.0.0.1" ? ({ allowed: true } as const) : classifyAddress(ip));
 
+// The hosts these tests may reach. Fetching is denied by default, so every
+// fixture host has to be allowlisted explicitly, as an operator would.
+const FIXTURE_HOSTS = parseHostAllowlist("fixture.test private.test metadata.test mixed.test mapped.test rebind.test rebind2.test other.test 127.0.0.1");
+
 function policy(overrides: Partial<FetchPolicy> = {}): FetchPolicy {
   return {
     ...DEFAULT_FETCH_POLICY,
     allowedSchemes: new Set(["http:", "https:"]),
     allowedPorts: new Set([port]),
+    allowedHosts: FIXTURE_HOSTS,
     isAddressAllowed: fixtureOnly,
     totalTimeoutMs: 3_000,
     connectTimeoutMs: 1_000,
@@ -271,7 +276,8 @@ describe("one address policy at every layer: URL literal, DNS answer, connected 
     it(`${ip} is ${reason ?? "allowed"} at every layer`, () => {
       const v6 = net.isIP(ip) === 6;
       assert.deepEqual(classifyAddress(ip), reason ? { allowed: false, reason } : { allowed: true });
-      const u = validateUrl(`https://${v6 ? `[${ip}]` : ip}/`, DEFAULT_FETCH_POLICY);
+      // Allowlist the literal itself so the URL layer's verdict comes from the address policy alone.
+      const u = validateUrl(`https://${v6 ? `[${ip}]` : ip}/`, { ...DEFAULT_FETCH_POLICY, allowedHosts: parseHostAllowlist(ip) });
       assert.equal(u.ok ? null : u.code, reason && `address_${reason}`, "URL layer");
       assert.equal(codeOf(() => validateDnsAnswers([{ address: ip, family: v6 ? 6 : 4 }], DEFAULT_FETCH_POLICY)), reason && `address_${reason}`, "DNS layer");
       assert.equal(codeOf(() => verifyPeer(ip, ip, DEFAULT_FETCH_POLICY)), reason && `peer_${reason}`, "peer layer");
@@ -281,7 +287,8 @@ describe("one address policy at every layer: URL literal, DNS answer, connected 
   it("fetchPublicPage denies every non-global IPv6 DNS answer before connecting", async () => {
     for (const [ip, reason] of table) {
       if (reason === null || net.isIP(ip) !== 6) continue;
-      const r = await fetchPublicPage("https://v6.test/", DEFAULT_FETCH_POLICY, deps({ resolve: async () => [{ address: ip, family: 6 }] }));
+      const v6Policy = { ...DEFAULT_FETCH_POLICY, allowedHosts: parseHostAllowlist("v6.test") };
+      const r = await fetchPublicPage("https://v6.test/", v6Policy, deps({ resolve: async () => [{ address: ip, family: 6 }] }));
       expectStatus(r, "policy_denied", `address_${reason}`);
     }
   });
@@ -322,6 +329,106 @@ describe("one address policy at every layer: URL literal, DNS answer, connected 
     seen.length = 0;
     expectStatus(await fetchPublicPage(url("/same-policy"), policy({ isAddressAllowed: recording }), deps()), "success");
     assert.deepEqual(seen, ["127.0.0.1", "127.0.0.1", "127.0.0.1"]);
+  });
+});
+
+describe("host allowlist: startup configuration, re-checked on every redirect", () => {
+  route("/allow-ok", html("allowed"));
+
+  /** Fixture DNS plus `extra`, recording every name that is looked up. */
+  function countingDeps(extra: Record<string, ResolvedAddress[]> = {}) {
+    const looked: string[] = [];
+    const d = deps({
+      resolve: async (host) => {
+        looked.push(host);
+        const entry = extra[host] ?? dns[host];
+        if (!entry) throw new Error("ENOTFOUND");
+        return typeof entry === "function" ? entry() : entry;
+      },
+    });
+    return { deps: d, looked };
+  }
+  const loopback: ResolvedAddress[] = [{ address: "127.0.0.1", family: 4 }];
+
+  it("denies every fetch by default, before any DNS lookup", async () => {
+    const c = countingDeps();
+    expectStatus(await fetchPublicPage("https://example.org/", DEFAULT_FETCH_POLICY, c.deps), "policy_denied", "host_allowlist_empty");
+    assert.deepEqual(c.looked, []);
+  });
+
+  it("denies an unlisted host before any DNS lookup or connection", async () => {
+    const c = countingDeps({ "unlisted.test": loopback });
+    hits = [];
+    expectStatus(await fetchPublicPage(url("/allow-ok", "unlisted.test"), policy(), c.deps), "policy_denied", "host_not_allowlisted");
+    assert.deepEqual(c.looked, []);
+    assert.deepEqual(hits, []);
+  });
+
+  for (const [label, target] of [
+    ["an unlisted host", "unlisted.test"],
+    ["a look-alike that starts with an allowlisted name", "fixture.test.evil.test"],
+    ["a look-alike that ends with an allowlisted name", "evilfixture.test"],
+  ] as const) {
+    it(`refuses a cross-domain redirect to ${label} before resolving it`, async () => {
+      route("/cross", (_req, res) => {
+        res.writeHead(302, { location: `http://${target}:${port}/allow-ok` });
+        res.end();
+      });
+      const c = countingDeps({ [target]: loopback });
+      hits = [];
+      expectStatus(await fetchPublicPage(url("/cross"), policy(), c.deps), "policy_denied", "host_not_allowlisted");
+      assert.deepEqual(c.looked, ["fixture.test"]);
+      assert.deepEqual(hits, ["/cross"]);
+    });
+  }
+
+  it("refuses a redirect to an unlisted IP literal even when the address policy allows it", async () => {
+    route("/to-literal", (_req, res) => {
+      res.writeHead(302, { location: `http://127.0.0.1:${port}/allow-ok` });
+      res.end();
+    });
+    hits = [];
+    const r = await fetchPublicPage(url("/to-literal"), policy({ allowedHosts: parseHostAllowlist("fixture.test") }), deps());
+    expectStatus(r, "policy_denied", "host_not_allowlisted");
+    assert.deepEqual(hits, ["/to-literal"]);
+  });
+
+  it("refuses a redirect that changes the port of an allowlisted host", async () => {
+    route("/to-port", (_req, res) => {
+      res.writeHead(302, { location: "http://fixture.test:1/allow-ok" });
+      res.end();
+    });
+    expectStatus(await fetchPublicPage(url("/to-port"), policy(), deps()), "policy_denied", "port_not_allowed");
+  });
+
+  it("follows a redirect to another allowlisted host and re-checks DNS and the peer there", async () => {
+    route("/to-alias", (_req, res) => {
+      res.writeHead(302, { location: `http://alias.test:${port}/allow-ok` });
+      res.end();
+    });
+    const c = countingDeps({ "alias.test": loopback });
+    const seen: string[] = [];
+    const recording = (ip: string) => (seen.push(ip), fixtureOnly(ip));
+    const r = await fetchPublicPage(url("/to-alias"), policy({ allowedHosts: parseHostAllowlist("fixture.test alias.test"), isAddressAllowed: recording }), c.deps);
+    expectStatus(r, "success");
+    assert.equal(r.redirect_chain.length, 1);
+    assert.deepEqual(c.looked, ["fixture.test", "alias.test"]);
+    assert.equal(seen.length, 6, "per hop: the DNS answer, the peer at connect, the peer at response");
+  });
+
+  it("matches a wildcard entry for subdomains only, at a label boundary", async () => {
+    const wildcard = policy({ allowedHosts: parseHostAllowlist("*.sub.test") });
+    const c = countingDeps({ "a.sub.test": loopback, "deep.a.sub.test": loopback, "sub.test": loopback, "evilsub.test": loopback });
+    expectStatus(await fetchPublicPage(url("/allow-ok", "a.sub.test"), wildcard, c.deps), "success");
+    expectStatus(await fetchPublicPage(url("/allow-ok", "deep.a.sub.test"), wildcard, c.deps), "success");
+    expectStatus(await fetchPublicPage(url("/allow-ok", "sub.test"), wildcard, c.deps), "policy_denied", "host_not_allowlisted");
+    expectStatus(await fetchPublicPage(url("/allow-ok", "evilsub.test"), wildcard, c.deps), "policy_denied", "host_not_allowlisted");
+    assert.deepEqual(c.looked, ["a.sub.test", "deep.a.sub.test"]);
+  });
+
+  it("does not replace the address policy: an allowlisted host that resolves privately is still denied", async () => {
+    // private.test is on FIXTURE_HOSTS but resolves to 10.0.0.7.
+    expectStatus(await fetchPublicPage(url("/allow-ok", "private.test"), policy(), deps()), "policy_denied", "address_private");
   });
 });
 
@@ -513,12 +620,28 @@ describe("challenges (RB-10, RB-11, RB-12)", () => {
 });
 
 describe("audit logging (RB-09)", () => {
-  it("never logs query values or credentials", async () => {
+  it("logs origins only: no path, query values or credentials", async () => {
+    route("/reset/PATH-T0KEN-9xq", (_req, res) => {
+      res.writeHead(302, { location: "/landing/REDIRECT-T0KEN-4vb?sid=SID-77c" });
+      res.end();
+    });
+    route("/landing/REDIRECT-T0KEN-4vb", html("ok"));
     logs.length = 0;
-    await fetchPublicPage(url("/ok?api_key=sk-live-123&q=topic"), policy(), deps());
+    const r = await fetchPublicPage(url("/reset/PATH-T0KEN-9xq?api_key=sk-live-123&q=topic"), policy(), deps());
+    expectStatus(r, "success");
+    // A denied request (credentials in the URL) is logged the same way.
+    expectStatus(await fetchPublicPage(`http://alice:pa55w0rd-Q@fixture.test:${port}/x`, policy(), deps()), "policy_denied", "url_credentials");
     const text = JSON.stringify(logs);
-    assert.ok(!text.includes("sk-live-123"));
-    assert.ok(!text.includes("topic"));
+    for (const secret of ["PATH-T0KEN-9xq", "REDIRECT-T0KEN-4vb", "SID-77c", "sk-live-123", "topic", "alice", "pa55w0rd-Q"]) {
+      assert.ok(!text.includes(secret), `log line contains ${secret}`);
+    }
+    assert.deepEqual(
+      logs.map((l) => [l.origin, l.final_origin]),
+      [
+        [`http://fixture.test:${port}`, `http://fixture.test:${port}`],
+        [`http://fixture.test:${port}`, undefined],
+      ],
+    );
     assert.ok(logs.every((l) => typeof l.request_id === "string"));
   });
 });

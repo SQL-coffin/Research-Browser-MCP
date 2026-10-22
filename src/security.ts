@@ -177,6 +177,97 @@ export function checkAddress(ip: string, policy: Pick<UrlPolicy, "isAddressAllow
 }
 
 // ---------------------------------------------------------------------------
+// Host allowlist (startup configuration only)
+// ---------------------------------------------------------------------------
+
+export interface HostAllowlist {
+  /** Normalized host names and canonical IP addresses; matched exactly. */
+  readonly exact: ReadonlySet<string>;
+  /** Parents from "*.parent" entries: any strict subdomain matches, the parent itself does not. */
+  readonly subdomainsOf: readonly string[];
+}
+
+/** The default: nothing may be fetched until hosts are configured at startup. */
+export const EMPTY_HOST_ALLOWLIST: HostAllowlist = { exact: new Set(), subdomainsOf: [] };
+
+export class HostAllowlistError extends Error {}
+
+const HOST_LABEL = /^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$/;
+
+/** A normalized (lower-case, Punycode) host name with at least two labels and no empty or malformed label. */
+function isValidHostName(host: string): boolean {
+  const labels = host.split(".");
+  return host.length <= 253 && labels.length >= 2 && labels.every((label) => HOST_LABEL.test(label));
+}
+
+/**
+ * Normalizes a configured host name exactly as request URLs are normalized
+ * (WHATWG URL: UTS #46 mapping, Punycode, lower case), minus one trailing dot.
+ * Returns null unless the result is a valid multi-label host name.
+ */
+function normalizeHostEntry(entry: string): string | null {
+  // A scheme, port, path, userinfo, IPv6 literal or percent-escape means this is not a bare host name.
+  if (!entry || /[/\\?#@:%[\]]/.test(entry)) return null;
+  let host: string;
+  try {
+    host = new URL(`https://${entry}/`).hostname.replace(/\.$/, "");
+  } catch {
+    return null;
+  }
+  return !isIP(host) && isValidHostName(host) ? host : null;
+}
+
+/**
+ * Parses the startup host allowlist. Entries are separated by commas or whitespace:
+ *   example.org     exactly this host, after normalization (case, trailing dot, IDN to Punycode)
+ *   *.example.org   any subdomain of example.org at a label boundary, but not example.org itself
+ *   93.184.215.14, 2606:4700::1111 or [2606:4700::1111]   exactly this IP address
+ * "*.org" and other single-label parents are rejected. Invalid entries throw
+ * HostAllowlistError, which names their positions but not their text, since a
+ * misplaced URL could carry credentials.
+ */
+export function parseHostAllowlist(spec: string): HostAllowlist {
+  const exact = new Set<string>();
+  const subdomainsOf = new Set<string>();
+  const invalid: number[] = [];
+  spec
+    .split(/[\s,]+/)
+    .filter(Boolean)
+    .forEach((entry, i) => {
+      const ip = entry.replace(/^\[(.*)\]$/, "$1");
+      if (entry.startsWith("*.")) {
+        const parent = normalizeHostEntry(entry.slice(2));
+        if (parent) subdomainsOf.add(parent);
+        else invalid.push(i + 1);
+      } else if (isIP(ip)) {
+        exact.add(canonicalAddress(ip)!);
+      } else {
+        const host = normalizeHostEntry(entry);
+        if (host) exact.add(host);
+        else invalid.push(i + 1);
+      }
+    });
+  if (invalid.length > 0) {
+    throw new HostAllowlistError(
+      `Invalid host allowlist entr${invalid.length === 1 ? "y" : "ies"} at position ${invalid.join(", ")}. ` +
+        'Use bare host names ("example.org"), "*.example.org" for subdomains, or IP addresses; no scheme, port, path or credentials.',
+    );
+  }
+  return { exact, subdomainsOf: [...subdomainsOf] };
+}
+
+export function isHostAllowlistEmpty(allowlist: HostAllowlist): boolean {
+  return allowlist.exact.size === 0 && allowlist.subdomainsOf.length === 0;
+}
+
+/** `host` must be a normalized host name (as validateUrl produces) or a canonical IP address. */
+export function isHostAllowlisted(host: string, allowlist: HostAllowlist): boolean {
+  if (allowlist.exact.has(host)) return true;
+  // Wildcards cover host names only, and match only below a label boundary.
+  return !isIP(host) && allowlist.subdomainsOf.some((parent) => host.endsWith(`.${parent}`));
+}
+
+// ---------------------------------------------------------------------------
 // URL policy
 // ---------------------------------------------------------------------------
 
@@ -185,6 +276,8 @@ export const MAX_URL_LENGTH = 2048;
 export interface UrlPolicy {
   allowedSchemes: ReadonlySet<string>;
   allowedPorts: ReadonlySet<number>;
+  /** Hosts that may be fetched. Set only from startup configuration; empty denies everything. */
+  allowedHosts: HostAllowlist;
   /**
    * The single destination-address policy. It judges IP-literal hosts here and,
    * in the fetcher, every DNS answer and the connected peer.
@@ -195,6 +288,7 @@ export interface UrlPolicy {
 export const DEFAULT_URL_POLICY: UrlPolicy = {
   allowedSchemes: new Set(["https:"]),
   allowedPorts: new Set([443]),
+  allowedHosts: EMPTY_HOST_ALLOWLIST,
   isAddressAllowed: classifyAddress,
 };
 
@@ -231,18 +325,39 @@ export function validateUrl(raw: string, policy: UrlPolicy = DEFAULT_URL_POLICY)
   if (!hostname) {
     return { ok: false, status: "invalid_input", code: "missing_host", message: "URL has no host" };
   }
+  // The allowlist is checked last: it can only narrow what the checks above allow.
   const bare = hostname.replace(/^\[|\]$/g, "");
   if (isIP(bare)) {
     const verdict = checkAddress(bare, policy);
     if (!verdict.allowed) {
       return { ok: false, status: "policy_denied", code: `address_${verdict.reason}`, message: "Destination address is not public" };
     }
-    return { ok: true, url, hostname: bare, port, ipLiteral: bare };
+    return allowlistDenial(canonicalAddress(bare)!, policy.allowedHosts) ?? { ok: true, url, hostname: bare, port, ipLiteral: bare };
   }
   if (hostname === "localhost" || BLOCKED_HOST_SUFFIXES.some((s) => hostname.endsWith(s)) || !hostname.includes(".")) {
     return { ok: false, status: "policy_denied", code: "host_not_public", message: "Host name is not a public DNS name" };
   }
-  return { ok: true, url, hostname, port, ipLiteral: null };
+  // The URL parser accepts names such as ".example.org" or "*.example.org"; neither
+  // may reach DNS or match a "*.example.org" allowlist entry.
+  if (!isValidHostName(hostname)) {
+    return { ok: false, status: "invalid_input", code: "invalid_host", message: "Host name is malformed" };
+  }
+  return allowlistDenial(hostname, policy.allowedHosts) ?? { ok: true, url, hostname, port, ipLiteral: null };
+}
+
+function allowlistDenial(host: string, allowlist: HostAllowlist): UrlCheck | null {
+  if (isHostAllowlistEmpty(allowlist)) {
+    return {
+      ok: false,
+      status: "policy_denied",
+      code: "host_allowlist_empty",
+      message: "No hosts are allowlisted, so nothing can be fetched; the operator configures RESEARCH_BROWSER_ALLOWED_HOSTS at startup",
+    };
+  }
+  if (!isHostAllowlisted(host, allowlist)) {
+    return { ok: false, status: "policy_denied", code: "host_not_allowlisted", message: "Host is not on the server's allowlist" };
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -253,22 +368,27 @@ const SENSITIVE_PARAM =
   /(token|key|secret|pass(word)?|pwd|auth|session|sess|sid|sig(nature)?|credential|code|jwt|bearer|cookie|otp|state|nonce|ticket)/i;
 
 /**
- * Display-safe URL: drops userinfo and fragment, and replaces the values of query
- * parameters whose names look secret-bearing. `mode: "log"` redacts every query value.
+ * Display-safe URL.
+ *   "display": drops userinfo and fragment and masks the values of query parameters
+ *              whose names look secret-bearing. Keeps the path: fetch results need
+ *              it to identify the evidence.
+ *   "origin":  scheme, host and port only, for logs, handoff records and challenge
+ *              reports, since a path segment can carry a secret too.
  */
-export function redactUrl(raw: string, mode: "display" | "log" = "display"): string {
+export function redactUrl(raw: string, mode: "display" | "origin" = "display"): string {
   let url: URL;
   try {
     url = new URL(raw);
   } catch {
     return "[unparseable-url]";
   }
+  if (mode === "origin") return url.protocol === "https:" || url.protocol === "http:" ? url.origin : "[non-http-url]";
   url.username = "";
   url.password = "";
   url.hash = "";
   const params = new URLSearchParams();
   for (const [k, v] of url.searchParams) {
-    params.append(k, mode === "log" || SENSITIVE_PARAM.test(k) ? "REDACTED" : v);
+    params.append(k, SENSITIVE_PARAM.test(k) ? "REDACTED" : v);
   }
   url.search = params.toString();
   return url.toString();

@@ -266,17 +266,18 @@ describe("resume: event time order (pause created_at <= issued_at <= now < expir
 });
 
 describe("pause: URL privacy and binding", () => {
-  const SECRET_URL = "https://alice-u53r:pa55w0rd-Xy@Example.ORG/paper?id=ID-q7Zp&token=s3cr3t-T0KEN#frag-Kq9";
-  const SECRETS = ["alice-u53r", "pa55w0rd-Xy", "ID-q7Zp", "s3cr3t-T0KEN", "frag-Kq9"];
-  const DISPLAY = "https://example.org/paper?id=REDACTED&token=REDACTED";
+  // A path token, a query token, credentials and a fragment in one URL.
+  const SECRET_URL = "https://alice-u53r:pa55w0rd-Xy@Example.ORG/acct-R9x/PATH-T0KEN-v8w?id=ID-q7Zp&token=s3cr3t-T0KEN#frag-Kq9";
+  const SECRETS = ["alice-u53r", "pa55w0rd-Xy", "acct-R9x", "PATH-T0KEN-v8w", "ID-q7Zp", "s3cr3t-T0KEN", "frag-Kq9"];
+  const ORIGIN = "https://example.org";
   const TOKEN_URL = "https://example.org/paper?token=AAAA-1111";
 
-  it("never keeps or returns the raw URL", async () => {
+  it("keeps and returns only the origin: no path, query, fragment or credentials", async () => {
     const s = setup({ sourceUrl: SECRET_URL });
-    assert.equal(s.paused.source_url, DISPLAY);
+    assert.equal(s.paused.source_url, ORIGIN);
     const resumed = await s.submit(s.event());
     assert.equal(resumed.next_state, "READY_TO_RESUME", "the host's own copy of the raw URL still binds");
-    assert.equal(resumed.source_url, DISPLAY);
+    assert.equal(resumed.source_url, ORIGIN);
     s.host.events.clear(); // the host's copy is the host's business; inspect only what the store holds
     const memory = inspect(s.store, { depth: Infinity, showHidden: true });
     assert.ok(memory.includes(s.paused.pause_id), "the inspection must reach the pause records");
@@ -287,14 +288,20 @@ describe("pause: URL privacy and binding", () => {
     }
   });
 
-  it("rejects an event whose URL differs only in the token value, although both redact identically", async () => {
-    const s = setup({ sourceUrl: TOKEN_URL });
-    assert.equal(s.paused.source_url, "https://example.org/paper?token=REDACTED");
-    assertBlocked(await s.submit(s.event({ source_url: "https://example.org/paper?token=BBBB-2222" })), "event_url_mismatch");
-    await assertPauseStillOpen(s);
-  });
+  for (const [label, sourceUrl, other] of [
+    ["path token", "https://example.org/share/PATH-AAAA-1111/view", "https://example.org/share/PATH-BBBB-2222/view"],
+    ["query token", TOKEN_URL, "https://example.org/paper?token=BBBB-2222"],
+    ["credentials", "https://alice:AAAA-1111@example.org/paper", "https://alice:BBBB-2222@example.org/paper"],
+  ] as const) {
+    it(`rejects an event whose URL differs only in the ${label}, although both show the same origin`, async () => {
+      const s = setup({ sourceUrl });
+      assert.equal(s.paused.source_url, ORIGIN);
+      assertBlocked(await s.submit(s.event({ source_url: other })), "event_url_mismatch");
+      await assertPauseStillOpen(s);
+    });
+  }
 
-  it("does not accept the redacted display URL as a binding", async () => {
+  it("does not accept the displayed origin as a binding", async () => {
     const s = setup({ sourceUrl: TOKEN_URL });
     assertBlocked(await s.submit(s.event({ source_url: s.paused.source_url })), "event_url_mismatch");
     await assertPauseStillOpen(s);
@@ -310,6 +317,8 @@ describe("pause: URL privacy and binding", () => {
     "https://x:y@example.org/paper?token=AAAA-1111",
     "https://example.org/Paper?token=AAAA-1111",
     "https://example.org/paper?token=AAAA-1111&x=1",
+    "https://example.org/paper",
+    "https://example.org/",
     "http://example.org/paper?token=AAAA-1111",
     "not a url",
   ]) {
@@ -322,8 +331,8 @@ describe("pause: URL privacy and binding", () => {
 
   it("describes what it actually retains", () => {
     const { paused } = setup({ sourceUrl: SECRET_URL });
-    assert.match(paused.data_retained, /query values removed/);
-    assert.match(paused.data_retained, /HMAC-SHA256 of the full URL/);
-    assert.match(paused.data_retained, /Not retained: the raw URL/);
+    assert.match(paused.data_retained, /the URL's origin \(scheme, host and port only\)/);
+    assert.match(paused.data_retained, /HMAC-SHA256 of the full canonical URL/);
+    assert.match(paused.data_retained, /Not retained: the raw URL, its path, query, fragment and credentials/);
   });
 });

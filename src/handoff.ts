@@ -51,8 +51,8 @@ export interface PauseInput {
 interface PauseRecord {
   pause_id: string;
   task_id: string;
-  /** For display only: scheme, host and path; userinfo, fragment and query values removed. */
-  display_url: string;
+  /** Shown to people: the URL's origin only (scheme, host, port). Path, query, fragment and userinfo are never stored. */
+  source_origin: string;
   /** HMAC-SHA256 of the canonical URL; the only form compared with an event's URL. */
   url_binding: Buffer;
   reason: ChallengeType;
@@ -68,6 +68,7 @@ export interface PauseResult {
   request_id: string;
   task_id: string;
   pause_id: string;
+  /** Origin only (scheme://host[:port]). Never a binding: events must carry the full URL. */
   source_url: string;
   reason: ChallengeType;
   resume_handle: string;
@@ -84,6 +85,7 @@ export interface ResumeResult {
   /** What the host should do next. The service never dispatches work itself. */
   next_state: "BLOCKED" | "READY_TO_RESUME" | "ALTERNATE_SOURCE" | "CANCELLED";
   task_id?: string;
+  /** Origin only, as in PauseResult. */
   source_url?: string;
   authorization_owner: "host_runtime" | "verified_host_event";
   replayed?: boolean;
@@ -189,8 +191,8 @@ export class HandoffStore {
     const record: PauseRecord = {
       pause_id: newRequestId(),
       task_id: input.task_id,
-      // The raw URL is not stored: it may carry tokens, credentials or signed query values.
-      display_url: redactUrl(canonical, "log"),
+      // The raw URL is not stored: its path, query or userinfo may carry tokens or credentials.
+      source_origin: redactUrl(canonical, "origin"),
       url_binding: this.bindUrl(canonical),
       reason: input.reason,
       created_at: now,
@@ -204,7 +206,7 @@ export class HandoffStore {
       request_id,
       task_id: record.task_id,
       pause_id: record.pause_id,
-      source_url: record.display_url,
+      source_url: record.source_origin,
       reason: record.reason,
       resume_handle: handle,
       expires_at: new Date(record.expires_at).toISOString(),
@@ -214,9 +216,9 @@ export class HandoffStore {
         "The person may verify and continue, choose an alternate public source, or cancel. Access is not guaranteed after verification.",
       data_retained:
         "Held in memory until the resume handle expires or is evicted: task_id, pause_id, reason, timestamps, policy version, " +
-        "a display URL (scheme, host and path; userinfo, fragment and query values removed) and an HMAC-SHA256 of the full URL " +
-        "under a per-store random key, used only to match the host's event. Not retained: the raw URL, completed_steps, next_step, " +
-        "credentials, cookies and page content.",
+        "the URL's origin (scheme, host and port only) and an HMAC-SHA256 of the full canonical URL under a per-store random key, " +
+        "used only to match the host's event. Not retained: the raw URL, its path, query, fragment and credentials, " +
+        "completed_steps, next_step, cookies and page content.",
       authorization_owner: "host_runtime",
     };
   }
@@ -238,7 +240,7 @@ export class HandoffStore {
     const now = this.opts.now();
     if (now >= record.expires_at) return deny("resume_handle_expired", "Resume handle has expired; pause again");
 
-    const binding = { task_id: record.task_id, source_url: record.display_url };
+    const binding = { task_id: record.task_id, source_url: record.source_origin };
 
     if (!this.opts.verifier) {
       // Without a trusted channel the event reference is just a claim. Report it and

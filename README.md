@@ -8,17 +8,62 @@ An auditable, read-only research browsing service exposed through the Model Cont
 
 Implemented:
 
-- `src/index.ts` — MCP stdio server exposing the five `research.*` tools.
-- `src/security.ts` — URL policy and a destination-address **allowlist**. An address passes only if it is global unicast (IPv4 below `224.0.0.0`, IPv6 inside `2000::/3`) and outside every special-purpose block (private, loopback, link-local, NAT64, 6to4, Teredo, documentation, cloud metadata, …). Anything else, e.g. `4000::1`, is denied as `not_global_unicast`. One policy function judges IP-literal URLs, every DNS answer and the connected peer, always on the canonical address spelling. Also redaction, challenge classification, declared-basis SHA-256.
-- `src/fetcher.ts` — read-only fetch with per-hop validation: URL policy → validate **every** DNS answer → connect through a pinned `lookup` that only returns the validated IP (no second DNS query, so no rebinding window) → verify the kernel-reported peer address at `connect`, before any request or TLS bytes are sent → bounded wire bytes, decoded bytes (gzip/deflate/br bombs), redirects, loops, text and total time. TLS verification is always on; no proxy, cookies, or caller headers are used.
+- `src/index.ts` — MCP stdio server exposing the five `research.*` tools. It reads the host allowlist from its environment at startup (see [Configuration](#configuration)).
+- `src/security.ts` — URL policy, the startup **host allowlist**, and a destination-address **allowlist**. An address passes only if it is global unicast (IPv4 below `224.0.0.0`, IPv6 inside `2000::/3`) and outside every special-purpose block (private, loopback, link-local, NAT64, 6to4, Teredo, documentation, cloud metadata, …). Anything else, e.g. `4000::1`, is denied as `not_global_unicast`. One policy function judges IP-literal URLs, every DNS answer and the connected peer, always on the canonical address spelling. Also redaction, challenge classification, declared-basis SHA-256.
+- `src/fetcher.ts` — read-only fetch with per-hop validation. Every hop, including every redirect, runs:
+  - the URL policy: scheme, port, credentials, public name or address, and host allowlist;
+  - validation of **every** DNS answer;
+  - a connect through a pinned `lookup` that only returns the validated IP, so there is no second DNS query and no rebinding window;
+  - a check of the kernel-reported peer address at `connect`, before any request or TLS bytes are sent;
+  - bounds on wire bytes, decoded bytes (gzip/deflate/br bombs), redirects, loops, text and total time.
+
+  TLS verification is always on; no proxy, cookies, or caller headers are used.
 - `src/handoff.ts` — pause/resume contract. Without a host-configured `HostEventVerifier`, resume always defers to the host. With one, it checks:
   - task, pause and URL binding;
   - the event's time order: RFC 3339 timestamps with an explicit offset, and pause time ≤ `issued_at` ≤ now < `expires_at`;
   - version drift;
   - idempotency.
 
-  Any rejection leaves the task `BLOCKED` and the pause unconsumed. Pause records never keep the raw URL. They keep a display form without userinfo, fragment or query values, and an HMAC of the canonical URL; event URLs are compared against that HMAC.
+  Any rejection leaves the task `BLOCKED` and the pause unconsumed. Pause records never keep the raw URL. They keep its origin and an HMAC of the canonical URL; event URLs are compared against that HMAC.
 - `src/search.ts` — provider allowlist from startup configuration only. No provider is enabled by default.
+
+### Configuration
+
+The server is configured only through its environment at startup; tool calls cannot change any of it.
+
+`RESEARCH_BROWSER_ALLOWED_HOSTS` lists the hosts `research.fetch_public_page` may fetch, separated by commas or whitespace:
+
+| Entry | Matches |
+|---|---|
+| `example.org` | Exactly `example.org`, compared after normalization: lower case, one trailing dot removed, IDN converted to Punycode (`bücher.example` is `xn--bcher-kva.example`). |
+| `*.example.org` | Any subdomain of `example.org` at a label boundary (`a.example.org`, `a.b.example.org`), but not `example.org` itself; list both if you need both. Single-label parents such as `*.org` are rejected. |
+| `93.184.215.14`, `2606:4700::1111` or `[2606:4700::1111]` | Exactly that IP address, in any spelling. |
+
+- **Unset or empty means every fetch is denied** with `host_allowlist_empty`, and the server says so on stderr at startup.
+- If any entry has a scheme, port, path, credentials, a misplaced `*` or an invalid name, the server refuses to start. The error names the entry's position, not its text.
+- The allowlist only narrows the other checks. A listed host still needs HTTPS on port 443, a public DNS name, and a public address for every DNS answer and for the connected peer.
+- Every redirect hop is checked again, so a redirect to an unlisted host is refused before it is resolved.
+
+Example MCP client configuration:
+
+```json
+{
+  "mcpServers": {
+    "research-browser": {
+      "command": "node",
+      "args": ["/path/to/Research-Browser-MCP/dist/index.js"],
+      "env": { "RESEARCH_BROWSER_ALLOWED_HOSTS": "en.wikipedia.org, *.arxiv.org, pubmed.ncbi.nlm.nih.gov" }
+    }
+  }
+}
+```
+
+### URL privacy
+
+- `pause_for_human` and `resume` outputs, and the in-memory handoff records, keep only the URL's origin (e.g. `https://example.org`): no path, query, fragment or credentials. Resume events are matched against an HMAC-SHA256 of the full canonical URL, never against the shown origin.
+- Audit log lines on stderr carry origins and `request_id` only.
+- `inspect_challenge` reports only the origin.
+- `fetch_public_page` results keep the path so they identify the evidence. They drop credentials and fragments, and mask the values of query parameters with secret-looking names (`token`, `key`, `sig`, `session`, …).
 
 Development uses npm (`package-lock.json`) and Node.js 22:
 
@@ -26,14 +71,21 @@ Development uses npm (`package-lock.json`) and Node.js 22:
 npm ci
 npm run typecheck   # strict tsc over src/ and tests/, no emit
 npm test            # node:test against local HTTP/HTTPS fixtures; no third-party sites
-npm run build && npm start
+npm run build
+npm run test:smoke  # starts dist/index.js and talks to it over stdio
+RESEARCH_BROWSER_ALLOWED_HOSTS="example.org" npm start
 ```
 
 Known gaps:
 
 - Address filtering in the process is not a substitute for deployment-level egress controls (network policy / firewall).
 - The IPv6 allowlist is all of `2000::/3` minus the listed special-purpose blocks. Unallocated parts of it are allowed; they are unroutable. A NAT64 gateway that uses a network-specific prefix inside `2000::/3` is not detected. A new IANA special-purpose block inside `2000::/3` needs a code change; one outside it is denied automatically.
-- Handoff display URLs keep the path, so a secret embedded in a path segment would still be shown there. Event times are compared with zero clock-skew tolerance, so the host's and this service's clocks must agree.
+- Host allowlist wildcards:
+  - A wildcard trusts every subdomain at any depth, including subdomains a third party controls.
+  - Public suffixes are only detected when they are a single label, so `*.co.uk` is accepted.
+  - Look-alike names in other scripts are different hosts after Punycode conversion, so they are denied unless listed.
+- `fetch_public_page` results keep the URL path and the values of query parameters with innocuous names, including in redirect targets. A secret there is returned to the caller that made the request.
+- Event times are compared with zero clock-skew tolerance, so the host's and this service's clocks must agree.
 - The DNS-rebinding tests use an injected resolver and loopback fixtures. They have not been run in a controlled network sandbox with a real authoritative DNS server.
 - No durable evidence sink: results report `evidence_persisted: false`. Handoff records are in memory only.
 - No search provider is enabled. Robots.txt is not consulted yet.
@@ -47,12 +99,19 @@ Known gaps:
 2. `npm run typecheck` runs strict TypeScript over `src/` and `tests/`.
 3. `npm test` runs the full suite inside a fresh network namespace that only has loopback, so a test that tries to reach a real host fails instead of passing. With `CI` set, the HTTPS tests, including the zero-byte ClientHello regression, cannot be skipped: a missing `openssl` fails the run.
 4. `npm run build` compiles to `dist/`.
+5. `npm run test:smoke` starts the built `dist/index.js` with the MCP SDK's `StdioClientTransport`, also inside the loopback-only namespace. It checks that:
+   - `initialize` and `tools/list` succeed and all five tools are listed;
+   - fetching is denied by default;
+   - the allowlist is read from the environment;
+   - a server with an invalid allowlist refuses to start.
+
+   Every request has a timeout. Every child process is stopped (stdin EOF, then SIGTERM, then SIGKILL) and verified gone, even when a test fails.
 
 CI does not check the following:
 
-- The built `dist/` server is never started; tests run the TypeScript sources through `tsx`.
-- Node.js 20 is not tested, although `engines` still allows it.
-- There is no lint or format step, dependency audit, or run on pushes to `main`.
+- A real page fetch through `dist/`: no allowlisted host is reachable from the namespace.
+- Node.js 20, although `engines` still allows it.
+- Lint or formatting, a dependency audit, or runs on pushes to `main`.
 
 ## Goals
 

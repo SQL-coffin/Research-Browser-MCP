@@ -1,6 +1,18 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { canonicalAddress, classifyAddress, classifyChallenge, DEFAULT_URL_POLICY, redactHeaders, redactUrl, sha256, validateUrl } from "../src/security.js";
+import {
+  canonicalAddress,
+  classifyAddress,
+  classifyChallenge,
+  DEFAULT_URL_POLICY,
+  HostAllowlistError,
+  isHostAllowlistEmpty,
+  parseHostAllowlist,
+  redactHeaders,
+  redactUrl,
+  sha256,
+  validateUrl,
+} from "../src/security.js";
 
 describe("classifyAddress (RB-02, RB-03)", () => {
   const denied: [string, string][] = [
@@ -103,8 +115,8 @@ describe("validateUrl (RB-02, RB-06)", () => {
     if (!r.ok) assert.equal(r.code, code, url);
   };
 
-  it("accepts a public https URL", () => {
-    const r = validateUrl("https://example.org/a?b=1");
+  it("accepts a public https URL on an allowlisted host", () => {
+    const r = validateUrl("https://example.org/a?b=1", { ...DEFAULT_URL_POLICY, allowedHosts: parseHostAllowlist("example.org") });
     assert.ok(r.ok);
     if (r.ok) assert.equal(r.port, 443);
   });
@@ -134,6 +146,7 @@ describe("validateUrl (RB-02, RB-06)", () => {
     const seen: string[] = [];
     const policy = {
       ...DEFAULT_URL_POLICY,
+      allowedHosts: parseHostAllowlist("127.0.0.1 8.8.8.8"),
       isAddressAllowed: (ip: string) => {
         seen.push(ip);
         return ip === "127.0.0.1" ? ({ allowed: true } as const) : ({ allowed: false, reason: "test" } as const);
@@ -155,13 +168,123 @@ describe("validateUrl (RB-02, RB-06)", () => {
   it("rejects garbage", () => reject("not a url", "url_unparseable"));
 });
 
+describe("host allowlist (startup configuration)", () => {
+  const list = parseHostAllowlist("Example.ORG., *.Wiki.Example.NET, bücher.example, 93.184.215.14, [2606:4700:4700::1111]");
+  const verdict = (url: string) => {
+    const r = validateUrl(url, { ...DEFAULT_URL_POLICY, allowedHosts: list });
+    return r.ok ? "ok" : r.code;
+  };
+
+  it("normalizes entries: case, trailing dot, IDN to Punycode, canonical IP spelling", () => {
+    assert.deepEqual([...list.exact].sort(), ["2606:4700:4700:0:0:0:0:1111", "93.184.215.14", "example.org", "xn--bcher-kva.example"]);
+    assert.deepEqual(list.subdomainsOf, ["wiki.example.net"]);
+  });
+
+  it("is empty when unset, and an empty allowlist denies everything", () => {
+    for (const spec of ["", "   ", ", ,"]) assert.ok(isHostAllowlistEmpty(parseHostAllowlist(spec)));
+    const r = validateUrl("https://example.org/");
+    assert.ok(!r.ok && r.code === "host_allowlist_empty");
+  });
+
+  for (const entry of [
+    "*",
+    "*.org",
+    "*.*",
+    "**.example.org",
+    "a.*.example.org",
+    "*example.org",
+    "https://example.org",
+    "example.org/path",
+    "example.org:443",
+    "user@example.org",
+    "localhost",
+    "example..org",
+    ".example.org",
+    "xn--zz.example",
+    "0x7f.1",
+    "exa%6dple.org",
+  ]) {
+    it(`rejects the entry ${JSON.stringify(entry)}`, () => {
+      assert.throws(
+        () => parseHostAllowlist(`example.com, ${entry}`),
+        (err: unknown) => err instanceof HostAllowlistError && /position 2\b/.test(err.message),
+      );
+    });
+  }
+
+  it("does not echo a rejected entry, which might carry credentials", () => {
+    assert.throws(
+      () => parseHostAllowlist("https://alice:s3cr3t-PW@example.org/"),
+      (err: unknown) => err instanceof HostAllowlistError && !err.message.includes("s3cr3t-PW") && !err.message.includes("alice"),
+    );
+  });
+
+  for (const url of [
+    "https://example.org/",
+    "https://EXAMPLE.org/",
+    "https://example.org./",
+    "https://example.org:443/",
+    "https://ｅｘａｍｐｌｅ.org/", // fullwidth letters map to the same ASCII name
+    "https://example。org/", // ideographic full stop maps to "."
+    "https://bücher.example/",
+    "https://BÜCHER.example/",
+    "https://xn--bcher-kva.example/",
+    "https://en.wiki.example.net/",
+    "https://en.m.wiki.example.net/",
+    "https://93.184.215.14/",
+    "https://[2606:4700:4700:0:0:0:0:1111]/",
+  ]) {
+    it(`allows ${url}`, () => assert.equal(verdict(url), "ok"));
+  }
+
+  for (const url of [
+    "https://example.com/",
+    "https://www.example.org/", // a subdomain of an exact entry
+    "https://example.org.evil.com/",
+    "https://evilexample.org/",
+    "https://example.org%2eevil.com/", // percent-encoded dot
+    "https://example.org．evil.com/", // fullwidth dot
+    "https://exаmple.org/", // Cyrillic "а": xn--exmple-4nf.org
+    "https://wiki.example.net/", // the parent of a wildcard entry
+    "https://xwiki.example.net/", // no label boundary
+    "https://93.184.215.15/",
+    "https://[2606:4700:4700::1112]/",
+    "https://8.8.8.8/",
+  ]) {
+    it(`denies ${url} as not allowlisted`, () => assert.equal(verdict(url), "host_not_allowlisted"));
+  }
+
+  it("rejects malformed host names that a wildcard entry would otherwise match", () => {
+    assert.equal(verdict("https://.wiki.example.net/"), "invalid_host");
+    assert.equal(verdict("https://*.wiki.example.net/"), "invalid_host");
+    assert.equal(verdict("https://a..wiki.example.net/"), "invalid_host");
+  });
+
+  it("only narrows the other checks: a listed host still needs a public name and address, https and port 443", () => {
+    const p = { ...DEFAULT_URL_POLICY, allowedHosts: parseHostAllowlist("127.0.0.1 printer.local example.org") };
+    const code = (url: string) => {
+      const r = validateUrl(url, p);
+      return r.ok ? "ok" : r.code;
+    };
+    assert.equal(code("https://127.0.0.1/"), "address_loopback");
+    assert.equal(code("https://printer.local/"), "host_not_public");
+    assert.equal(code("http://example.org/"), "scheme_not_allowed");
+    assert.equal(code("https://example.org:8443/"), "port_not_allowed");
+    assert.equal(code("https://user:pw@example.org/"), "url_credentials");
+  });
+});
+
 describe("redaction (RB-09)", () => {
   it("drops userinfo and fragments and masks secret-looking params for display", () => {
     const out = redactUrl("https://u:p@example.org/x?q=cats&api_key=abc123&token=zzz#frag");
     assert.equal(out, "https://example.org/x?q=cats&api_key=REDACTED&token=REDACTED");
   });
-  it("masks every query value in log mode", () => {
-    assert.equal(redactUrl("https://example.org/x?q=cats", "log"), "https://example.org/x?q=REDACTED");
+  it("keeps only the origin in origin mode", () => {
+    assert.equal(redactUrl("https://alice:pw@Example.ORG:443/reset/PATH-T0KEN?token=Q&q=cats#frag", "origin"), "https://example.org");
+    assert.equal(redactUrl("http://example.org:8080/a", "origin"), "http://example.org:8080");
+    assert.equal(redactUrl("https://[2606:4700::1111]/a", "origin"), "https://[2606:4700::1111]");
+    assert.equal(redactUrl("file:///etc/passwd", "origin"), "[non-http-url]");
+    assert.equal(redactUrl("not a url", "origin"), "[unparseable-url]");
   });
   it("redacts sensitive headers", () => {
     const h = redactHeaders({ "Set-Cookie": "a=b", Authorization: "Bearer x", "content-type": "text/html", "X-Session-Id": "1" });
