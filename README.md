@@ -14,10 +14,12 @@ Implemented:
 - `src/handoff.ts` — pause/resume contract. Without a host-configured `HostEventVerifier`, resume always defers to the host. With one, it checks task, pause, URL, expiry, version drift and idempotency.
 - `src/search.ts` — provider allowlist from startup configuration only. No provider is enabled by default.
 
+Development uses npm (`package-lock.json`) and Node.js 22:
+
 ```bash
-npm install
-npm test          # node:test against local HTTP/HTTPS fixtures; no third-party sites
-npm run typecheck
+npm ci
+npm run typecheck   # strict tsc over src/ and tests/, no emit
+npm test            # node:test against local HTTP/HTTPS fixtures; no third-party sites
 npm run build && npm start
 ```
 
@@ -28,6 +30,21 @@ Known gaps:
 - No durable evidence sink: results report `evidence_persisted: false`. Handoff records are in memory only.
 - No search provider is enabled. Robots.txt is not consulted yet.
 - Text extraction is regex-based and is not a full HTML parser.
+
+### Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every `pull_request`. It uses Ubuntu 24.04 and Node.js 22, has a read-only `contents: read` token, uses no secrets, and does not use `pull_request_target`. The steps are:
+
+1. `npm ci` installs exactly what `package-lock.json` records.
+2. `npm run typecheck` runs strict TypeScript over `src/` and `tests/`.
+3. `npm test` runs the full suite inside a fresh network namespace that only has loopback, so a test that tries to reach a real host fails instead of passing. With `CI` set, the HTTPS tests, including the zero-byte ClientHello regression, cannot be skipped: a missing `openssl` fails the run.
+4. `npm run build` compiles to `dist/`.
+
+CI does not check the following:
+
+- The built `dist/` server is never started; tests run the TypeScript sources through `tsx`.
+- Node.js 20 is not tested, although `engines` still allows it.
+- There is no lint or format step, dependency audit, or run on pushes to `main`.
 
 ## Goals
 

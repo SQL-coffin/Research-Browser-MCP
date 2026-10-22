@@ -416,9 +416,11 @@ describe("audit logging (RB-09)", () => {
 
 // ---------------------------------------------------------------------------
 // HTTPS: certificate verification is always on; peer pinning applies to TLS too.
+// Local runs without openssl may skip this block; under CI it must run (a missing
+// openssl fails the suite) so the TLS regressions can never pass by being skipped.
 // ---------------------------------------------------------------------------
 
-describe("https", { skip: !hasOpenssl() && "openssl not available" }, () => {
+describe("https", { skip: !process.env.CI && !hasOpenssl() && "openssl not available" }, () => {
   let dir: string;
   let tls: https.Server;
   let tlsPort: number;

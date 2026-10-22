@@ -1,0 +1,43 @@
+name: CI
+
+# Plain pull_request (never pull_request_target): PR code runs with a read-only
+# token and no access to repository secrets.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Typecheck, test, build
+    # Pinned image: the test step relies on Ubuntu 24.04's AppArmor userns sysctl.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        with:
+          # The version the project is developed and its lockfile generated with.
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck (strict, src and tests)
+        run: npm run typecheck
+
+      - name: Test (loopback-only network namespace)
+        # Fixtures listen on 127.0.0.1 and resolvers are injected, so the suite
+        # needs no network. Running it in a fresh network namespace that only has
+        # loopback turns any attempt to reach a real host into a failure.
+        # CI=true (set by Actions) also forbids skipping the HTTPS tests.
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          unshare --map-root-user --net bash -c 'ip link set lo up && npm test'
+
+      - name: Build
+        run: npm run build
