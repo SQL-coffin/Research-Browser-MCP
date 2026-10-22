@@ -7,27 +7,38 @@ import { isIP } from "node:net";
 
 export type AddressVerdict = { allowed: true } | { allowed: false; reason: string };
 
-interface Range {
+interface Prefix {
   bytes: number[];
   prefix: number;
+}
+
+interface Range extends Prefix {
   reason: string;
 }
 
-function v4(cidr: string, reason: string): Range {
+function v4(cidr: string, reason = ""): Range {
   const [addr, prefix] = cidr.split("/") as [string, string];
   return { bytes: addr.split(".").map(Number), prefix: Number(prefix), reason };
 }
 
-function v6(cidr: string, reason: string): Range {
+function v6(cidr: string, reason = ""): Range {
   const [addr, prefix] = cidr.split("/") as [string, string];
   const bytes = parseIPv6(addr);
   if (!bytes) throw new Error(`bad IPv6 range ${cidr}`);
   return { bytes, prefix: Number(prefix), reason };
 }
 
-// IANA special-purpose registries plus cloud metadata endpoints. Anything that is
-// not globally routable public unicast is denied.
-const BLOCKED_V4: Range[] = [
+// Allowlist: an address can only pass if it lies in global unicast space.
+// IPv4: everything below 224.0.0.0 (multicast 224/4 and reserved 240/4 are outside).
+// IPv6: 2000::/3, the only block IANA allocates as global unicast. The rest of the
+// IPv6 space (4000::/3, 8000::/1, ...) is denied without having to be enumerated.
+const GLOBAL_UNICAST_V4: Prefix[] = [v4("0.0.0.0/1"), v4("128.0.0.0/2"), v4("192.0.0.0/3")];
+const GLOBAL_UNICAST_V6: Prefix[] = [v6("2000::/3")];
+
+// Special-purpose blocks (IANA registries plus cloud metadata endpoints) that are
+// denied even inside global unicast space. Entries outside that space are denied
+// anyway; they are listed so the denial reason is specific.
+const SPECIAL_V4: Range[] = [
   v4("0.0.0.0/8", "unspecified"),
   v4("10.0.0.0/8", "private"),
   v4("100.64.0.0/10", "carrier_grade_nat"), // also covers 100.100.100.200 (Alibaba metadata)
@@ -48,7 +59,7 @@ const BLOCKED_V4: Range[] = [
   v4("240.0.0.0/4", "reserved"), // includes 255.255.255.255 broadcast
 ];
 
-const BLOCKED_V6: Range[] = [
+const SPECIAL_V6: Range[] = [
   v6("::/96", "unspecified_or_ipv4_compatible"), // ::, ::1 handled below, ::a.b.c.d
   v6("::1/128", "loopback"),
   v6("64:ff9b::/96", "nat64"),
@@ -65,7 +76,7 @@ const BLOCKED_V6: Range[] = [
   v6("ff00::/8", "multicast"),
 ];
 
-function inRange(bytes: number[], range: Range): boolean {
+function inRange(bytes: number[], range: Prefix): boolean {
   let bits = range.prefix;
   for (let i = 0; bits > 0; i++, bits -= 8) {
     const mask = bits >= 8 ? 0xff : (0xff << (8 - bits)) & 0xff;
@@ -120,23 +131,26 @@ function mappedIPv4(bytes: number[]): number[] | null {
   return bytes.slice(12);
 }
 
+function judge(bytes: number[], globalUnicast: Prefix[], special: Range[]): AddressVerdict {
+  // Longest-prefix match so ::1 reports "loopback" rather than the broader ::/96.
+  const hit = special.filter((r) => inRange(bytes, r)).sort((a, b) => b.prefix - a.prefix)[0];
+  if (hit) return { allowed: false, reason: hit.reason };
+  return globalUnicast.some((p) => inRange(bytes, p)) ? { allowed: true } : { allowed: false, reason: "not_global_unicast" };
+}
+
 /**
- * Default destination policy: only globally routable public unicast addresses.
- * IPv4-mapped IPv6 addresses are judged by their embedded IPv4 address.
+ * Default destination policy: an address is allowed only if it is global unicast
+ * (see GLOBAL_UNICAST_*) and outside every special-purpose block. IPv4-mapped IPv6
+ * addresses (::ffff:a.b.c.d) are judged by their embedded IPv4 address.
  */
 export function classifyAddress(ip: string): AddressVerdict {
   const b4 = parseIPv4(ip);
-  if (b4) {
-    const hit = BLOCKED_V4.find((r) => inRange(b4, r));
-    return hit ? { allowed: false, reason: hit.reason } : { allowed: true };
-  }
+  if (b4) return judge(b4, GLOBAL_UNICAST_V4, SPECIAL_V4);
   const b6 = parseIPv6(ip);
   if (!b6) return { allowed: false, reason: "not_an_ip_address" };
   const mapped = mappedIPv4(b6);
   if (mapped) return classifyAddress(mapped.join("."));
-  // Longest-prefix match so ::1 reports "loopback" rather than the broader ::/96.
-  const hits = BLOCKED_V6.filter((r) => inRange(b6, r)).sort((a, b) => b.prefix - a.prefix);
-  return hits[0] ? { allowed: false, reason: hits[0].reason } : { allowed: true };
+  return judge(b6, GLOBAL_UNICAST_V6, SPECIAL_V6);
 }
 
 /** Canonical textual form used to compare a validated address with the connected peer. */
@@ -152,6 +166,16 @@ export function canonicalAddress(ip: string): string | null {
   return groups.join(":");
 }
 
+/**
+ * Applies an address policy to the canonical spelling of `ip`. The URL, DNS and
+ * peer checks all go through here, so one policy sees identical strings at every
+ * layer (e.g. "::ffff:7f00:1" and "127.0.0.1" are both judged as "127.0.0.1").
+ */
+export function checkAddress(ip: string, policy: Pick<UrlPolicy, "isAddressAllowed">): AddressVerdict {
+  const canonical = canonicalAddress(ip);
+  return canonical === null ? { allowed: false, reason: "not_an_ip_address" } : policy.isAddressAllowed(canonical);
+}
+
 // ---------------------------------------------------------------------------
 // URL policy
 // ---------------------------------------------------------------------------
@@ -161,11 +185,17 @@ export const MAX_URL_LENGTH = 2048;
 export interface UrlPolicy {
   allowedSchemes: ReadonlySet<string>;
   allowedPorts: ReadonlySet<number>;
+  /**
+   * The single destination-address policy. It judges IP-literal hosts here and,
+   * in the fetcher, every DNS answer and the connected peer.
+   */
+  isAddressAllowed: (ip: string) => AddressVerdict;
 }
 
 export const DEFAULT_URL_POLICY: UrlPolicy = {
   allowedSchemes: new Set(["https:"]),
   allowedPorts: new Set([443]),
+  isAddressAllowed: classifyAddress,
 };
 
 const BLOCKED_HOST_SUFFIXES = [".localhost", ".local", ".internal", ".home.arpa", ".lan", ".intranet", ".corp"];
@@ -203,7 +233,7 @@ export function validateUrl(raw: string, policy: UrlPolicy = DEFAULT_URL_POLICY)
   }
   const bare = hostname.replace(/^\[|\]$/g, "");
   if (isIP(bare)) {
-    const verdict = classifyAddress(bare);
+    const verdict = checkAddress(bare, policy);
     if (!verdict.allowed) {
       return { ok: false, status: "policy_denied", code: `address_${verdict.reason}`, message: "Destination address is not public" };
     }

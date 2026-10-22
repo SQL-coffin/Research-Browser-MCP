@@ -8,8 +8,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import zlib from "node:zlib";
-import { DEFAULT_FETCH_POLICY, fetchPublicPage, verifyPeer, type FetchDeps, type FetchPolicy, type FetchResult, type ResolvedAddress } from "../src/fetcher.js";
-import { classifyAddress } from "../src/security.js";
+import {
+  DEFAULT_FETCH_POLICY,
+  fetchPublicPage,
+  validateDnsAnswers,
+  verifyPeer,
+  type FetchDeps,
+  type FetchPolicy,
+  type FetchResult,
+  type ResolvedAddress,
+} from "../src/fetcher.js";
+import { classifyAddress, validateUrl } from "../src/security.js";
 
 // ---------------------------------------------------------------------------
 // Local fixture server. The fetcher treats 127.0.0.1 as the ONLY "public"
@@ -213,6 +222,106 @@ describe("destination validation (RB-02, RB-03, RB-05)", () => {
     assert.throws(() => verifyPeer("127.0.0.2", "127.0.0.1", p), /does not match/);
     assert.throws(() => verifyPeer(undefined, "127.0.0.1", p), /does not match/);
     assert.doesNotThrow(() => verifyPeer("::ffff:127.0.0.1", "127.0.0.1", p));
+  });
+});
+
+describe("one address policy at every layer: URL literal, DNS answer, connected peer (RB-02, RB-03)", () => {
+  // null = allowed. The verdict and reason must be identical at all three layers.
+  const table: [string, string | null][] = [
+    ["4000::1", "not_global_unicast"],
+    ["8000::1", "not_global_unicast"],
+    ["::ffff:0:a00:1", "not_global_unicast"],
+    ["::1", "loopback"],
+    ["::", "unspecified_or_ipv4_compatible"],
+    ["::a00:1", "unspecified_or_ipv4_compatible"],
+    ["::ffff:127.0.0.1", "loopback"],
+    ["::ffff:10.0.0.1", "private"],
+    ["64:ff9b::a9fe:a9fe", "nat64"], // NAT64 form of 169.254.169.254
+    ["64:ff9b:1::1", "nat64"],
+    ["100::1", "discard"],
+    ["2001::1", "reserved"], // Teredo
+    ["2001:2::1", "reserved"],
+    ["2001:db8::1", "documentation"],
+    ["2002:a9fe:a9fe::1", "6to4"], // 6to4 form of 169.254.169.254
+    ["3fff::1", "documentation"],
+    ["5f00::1", "reserved"],
+    ["fc00::1", "unique_local"],
+    ["fd00:ec2::254", "unique_local"], // AWS IMDS over IPv6
+    ["fe80::1", "link_local"],
+    ["fec0::1", "site_local"],
+    ["ff02::1", "multicast"],
+    ["127.0.0.1", "loopback"],
+    ["169.254.169.254", "link_local"],
+    ["2606:4700:4700::1111", null],
+    ["2001:4860:4860::8888", null],
+    ["::ffff:8.8.8.8", null],
+    ["8.8.8.8", null],
+  ];
+
+  const codeOf = (fn: () => unknown): string | null => {
+    try {
+      fn();
+      return null;
+    } catch (err) {
+      return (err as { code?: string }).code ?? String(err);
+    }
+  };
+
+  for (const [ip, reason] of table) {
+    it(`${ip} is ${reason ?? "allowed"} at every layer`, () => {
+      const v6 = net.isIP(ip) === 6;
+      assert.deepEqual(classifyAddress(ip), reason ? { allowed: false, reason } : { allowed: true });
+      const u = validateUrl(`https://${v6 ? `[${ip}]` : ip}/`, DEFAULT_FETCH_POLICY);
+      assert.equal(u.ok ? null : u.code, reason && `address_${reason}`, "URL layer");
+      assert.equal(codeOf(() => validateDnsAnswers([{ address: ip, family: v6 ? 6 : 4 }], DEFAULT_FETCH_POLICY)), reason && `address_${reason}`, "DNS layer");
+      assert.equal(codeOf(() => verifyPeer(ip, ip, DEFAULT_FETCH_POLICY)), reason && `peer_${reason}`, "peer layer");
+    });
+  }
+
+  it("fetchPublicPage denies every non-global IPv6 DNS answer before connecting", async () => {
+    for (const [ip, reason] of table) {
+      if (reason === null || net.isIP(ip) !== 6) continue;
+      const r = await fetchPublicPage("https://v6.test/", DEFAULT_FETCH_POLICY, deps({ resolve: async () => [{ address: ip, family: 6 }] }));
+      expectStatus(r, "policy_denied", `address_${reason}`);
+    }
+  });
+
+  it("denies an IPv6 literal URL without resolving or connecting", async () => {
+    let resolved = 0;
+    const r = await fetchPublicPage("https://[4000::1]/", DEFAULT_FETCH_POLICY, deps({ resolve: async () => (resolved++, []) }));
+    expectStatus(r, "policy_denied", "address_not_global_unicast");
+    assert.equal(resolved, 0);
+  });
+
+  it("gives the policy one canonical spelling per address at every layer", () => {
+    const seen: string[] = [];
+    const p = { ...DEFAULT_FETCH_POLICY, isAddressAllowed: (ip: string) => (seen.push(ip), { allowed: true } as const) };
+    for (const [spelling, pinned] of [
+      ["::ffff:7f00:1", "127.0.0.1"],
+      ["::ffff:127.0.0.1", "127.0.0.1"],
+      ["0:0:0:0:0:ffff:7f00:1", "127.0.0.1"],
+      ["2001:4860:4860::8888", "2001:4860:4860::8888"],
+      ["2001:4860:4860:0000:0000:0000:0000:8888", "2001:4860:4860::8888"],
+    ]) {
+      validateUrl(`https://[${spelling}]/`, p);
+      validateDnsAnswers([{ address: spelling!, family: 6 }], p);
+      verifyPeer(spelling, pinned!, p);
+    }
+    assert.equal(seen.length, 15);
+    assert.deepEqual([...new Set(seen)].sort(), ["127.0.0.1", "2001:4860:4860:0:0:0:0:8888"]);
+  });
+
+  it("consults the same policy function for the URL literal, the DNS answer and the live peer", async () => {
+    route("/same-policy", html("ok"));
+    const seen: string[] = [];
+    const recording = (ip: string) => (seen.push(ip), fixtureOnly(ip));
+    // IP-literal URL: URL layer, DNS layer (the literal), peer at connect, peer at response.
+    expectStatus(await fetchPublicPage(url("/same-policy", "127.0.0.1"), policy({ isAddressAllowed: recording }), deps()), "success");
+    assert.deepEqual(seen, ["127.0.0.1", "127.0.0.1", "127.0.0.1", "127.0.0.1"]);
+    // Host name: DNS answer, peer at connect, peer at response.
+    seen.length = 0;
+    expectStatus(await fetchPublicPage(url("/same-policy"), policy({ isAddressAllowed: recording }), deps()), "success");
+    assert.deepEqual(seen, ["127.0.0.1", "127.0.0.1", "127.0.0.1"]);
   });
 });
 

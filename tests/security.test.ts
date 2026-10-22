@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { canonicalAddress, classifyAddress, classifyChallenge, redactHeaders, redactUrl, sha256, validateUrl } from "../src/security.js";
+import { canonicalAddress, classifyAddress, classifyChallenge, DEFAULT_URL_POLICY, redactHeaders, redactUrl, sha256, validateUrl } from "../src/security.js";
 
 describe("classifyAddress (RB-02, RB-03)", () => {
   const denied: [string, string][] = [
@@ -30,6 +30,19 @@ describe("classifyAddress (RB-02, RB-03)", () => {
     ["64:ff9b::a00:1", "nat64"],
     ["2002:7f00:1::", "6to4"],
     ["2001:0:4136:e378::1", "reserved"],
+    // Special-purpose blocks inside 2000::/3: global unicast space, still denied.
+    ["2001:2::1", "reserved"], // benchmarking, inside 2001::/23
+    ["2001:20::1", "reserved"], // ORCHIDv2, inside 2001::/23
+    ["3fff::1", "documentation"],
+    // Outside 2000::/3: denied by the allowlist, whether or not a block is listed.
+    ["4000::1", "not_global_unicast"],
+    ["8000::1", "not_global_unicast"],
+    ["e000::1", "not_global_unicast"],
+    ["1::1", "not_global_unicast"],
+    ["::ffff:0:a00:1", "not_global_unicast"], // IPv4-translated (SIIT), not IPv4-mapped
+    ["100::1", "discard"],
+    ["5f00::1", "reserved"],
+    ["fec0::1", "site_local"],
   ];
   for (const [ip, reason] of denied) {
     it(`denies ${ip} (${reason})`, () => {
@@ -37,11 +50,42 @@ describe("classifyAddress (RB-02, RB-03)", () => {
     });
   }
 
-  for (const ip of ["93.184.215.14", "1.1.1.1", "8.8.8.8", "2606:4700:4700::1111", "::ffff:8.8.8.8", "172.32.0.1", "100.128.0.1"]) {
+  for (const ip of [
+    "93.184.215.14",
+    "1.1.1.1",
+    "8.8.8.8",
+    "2606:4700:4700::1111",
+    "2001:4860:4860::8888", // 2001::/16 but outside the special 2001::/23
+    "2a00:1450:4001:80b::200e",
+    "::ffff:8.8.8.8",
+    "172.32.0.1",
+    "100.128.0.1",
+  ]) {
     it(`allows public ${ip}`, () => assert.deepEqual(classifyAddress(ip), { allowed: true }));
   }
 
   it("denies non-addresses", () => assert.equal(classifyAddress("example.com").allowed, false));
+
+  it("allows IPv6 only inside 2000::/3 (sweep of every first hextet)", () => {
+    let allowed = 0;
+    for (let h = 0; h <= 0xffff; h++) {
+      const verdict = classifyAddress(`${h.toString(16)}:abcd::1`);
+      if (!verdict.allowed) continue;
+      allowed++;
+      assert.ok(h >= 0x2000 && h <= 0x3fff, `${h.toString(16)}:abcd::1 is outside 2000::/3 but was allowed`);
+    }
+    // Every 2000::/3 first hextet passes except 2002::/16 (6to4); with ":abcd" the
+    // address sits outside 2001::/23, 2001:db8::/32 and 3fff::/20.
+    assert.equal(allowed, 0x2000 - 1);
+  });
+
+  it("allows IPv4 only below 224.0.0.0 and outside special blocks (sweep of every first octet)", () => {
+    const allowed: number[] = [];
+    for (let o = 0; o <= 255; o++) if (classifyAddress(`${o}.1.2.3`).allowed) allowed.push(o);
+    assert.equal(Math.max(...allowed), 223);
+    for (const o of [0, 10, 127]) assert.ok(!allowed.includes(o), `${o}.1.2.3 was allowed`);
+    assert.equal(allowed.length, 224 - 3);
+  });
 });
 
 describe("canonicalAddress", () => {
@@ -80,6 +124,26 @@ describe("validateUrl (RB-02, RB-06)", () => {
   it("rejects bracketed IPv6 loopback and metadata", () => {
     reject("https://[::1]/", "address_loopback");
     reject("https://[::ffff:169.254.169.254]/", "address_link_local");
+  });
+  it("rejects IPv6 literals outside global unicast", () => {
+    reject("https://[4000::1]/", "address_not_global_unicast");
+    reject("https://[fe80::1]/", "address_link_local");
+    reject("https://[2001:db8::1]/", "address_documentation");
+  });
+  it("judges IP literals with the policy's own address function, on the canonical spelling", () => {
+    const seen: string[] = [];
+    const policy = {
+      ...DEFAULT_URL_POLICY,
+      isAddressAllowed: (ip: string) => {
+        seen.push(ip);
+        return ip === "127.0.0.1" ? ({ allowed: true } as const) : ({ allowed: false, reason: "test" } as const);
+      },
+    };
+    assert.ok(validateUrl("https://127.0.0.1/", policy).ok, "custom policy must override the default");
+    assert.ok(validateUrl("https://[::ffff:7f00:1]/", policy).ok);
+    const r = validateUrl("https://8.8.8.8/", policy);
+    assert.ok(!r.ok && r.code === "address_test");
+    assert.deepEqual(seen, ["127.0.0.1", "127.0.0.1", "8.8.8.8"]);
   });
   it("rejects internal-looking names", () => {
     reject("https://localhost/", "host_not_public");

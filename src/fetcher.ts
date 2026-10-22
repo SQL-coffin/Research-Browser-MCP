@@ -7,14 +7,13 @@ import { Transform, type Readable } from "node:stream";
 import zlib from "node:zlib";
 import {
   canonicalAddress,
-  classifyAddress,
+  checkAddress,
   classifyChallenge,
   DEFAULT_URL_POLICY,
   redactHeaders,
   redactUrl,
   sha256,
   validateUrl,
-  type AddressVerdict,
   type ChallengeResult,
   type ContentHash,
   type UrlPolicy,
@@ -31,11 +30,10 @@ export interface FetchPolicy extends UrlPolicy {
   connectTimeoutMs: number;
   totalTimeoutMs: number;
   allowedContentTypes: ReadonlySet<string>;
-  /** Applied to every DNS answer AND to the connected peer address. */
-  isAddressAllowed: (ip: string) => AddressVerdict;
 }
 
 export const DEFAULT_FETCH_POLICY: FetchPolicy = {
+  // Includes isAddressAllowed: the same policy judges URLs, DNS answers and peers.
   ...DEFAULT_URL_POLICY,
   maxRedirects: 5,
   maxWireBytes: 2 * 1024 * 1024,
@@ -44,7 +42,6 @@ export const DEFAULT_FETCH_POLICY: FetchPolicy = {
   connectTimeoutMs: 5_000,
   totalTimeoutMs: 15_000,
   allowedContentTypes: new Set(["text/html", "application/xhtml+xml", "text/plain"]),
-  isAddressAllowed: classifyAddress,
 };
 
 export interface ResolvedAddress {
@@ -121,10 +118,21 @@ class FetchStop extends Error {
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 /**
- * Resolves the host and validates EVERY answer. A mixed answer (one public, one
- * private) is rejected outright rather than filtered, because some resolvers
- * return the attacker-preferred address first only some of the time.
+ * DNS layer of the address policy: EVERY answer must pass. A mixed answer (one
+ * public, one private) is rejected outright rather than filtered, because some
+ * resolvers return the attacker-preferred address first only some of the time.
  */
+export function validateDnsAnswers(answers: ResolvedAddress[], policy: UrlPolicy): ResolvedAddress {
+  if (answers.length === 0) throw new FetchStop("provider_unavailable", "dns_no_answer", "Host name has no addresses");
+  for (const a of answers) {
+    const verdict = checkAddress(a.address, policy);
+    if (!verdict.allowed) {
+      throw new FetchStop("policy_denied", `address_${verdict.reason}`, "Destination resolves to a non-public address");
+    }
+  }
+  return answers[0]!;
+}
+
 async function resolveAndValidate(hostname: string, ipLiteral: string | null, policy: FetchPolicy, deps: FetchDeps): Promise<ResolvedAddress> {
   let answers: ResolvedAddress[];
   if (ipLiteral) {
@@ -136,14 +144,7 @@ async function resolveAndValidate(hostname: string, ipLiteral: string | null, po
       throw new FetchStop("provider_unavailable", "dns_resolution_failed", "Host name could not be resolved");
     }
   }
-  if (answers.length === 0) throw new FetchStop("provider_unavailable", "dns_no_answer", "Host name has no addresses");
-  for (const a of answers) {
-    const verdict = policy.isAddressAllowed(a.address);
-    if (!verdict.allowed) {
-      throw new FetchStop("policy_denied", `address_${verdict.reason}`, "Destination resolves to a non-public address");
-    }
-  }
-  return answers[0]!;
+  return validateDnsAnswers(answers, policy);
 }
 
 /**
@@ -159,12 +160,12 @@ function pinnedLookup(pinned: ResolvedAddress): LookupFunction {
 }
 
 /** Second, independent check on the address the kernel actually connected to. */
-export function verifyPeer(remoteAddress: string | undefined, pinned: string, policy: FetchPolicy): void {
+export function verifyPeer(remoteAddress: string | undefined, pinned: string, policy: UrlPolicy): void {
   const peer = remoteAddress ? canonicalAddress(remoteAddress) : null;
   if (!peer || peer !== canonicalAddress(pinned)) {
     throw new FetchStop("policy_denied", "peer_address_mismatch", "Connected peer does not match the validated address");
   }
-  const verdict = policy.isAddressAllowed(peer);
+  const verdict = checkAddress(peer, policy);
   if (!verdict.allowed) {
     throw new FetchStop("policy_denied", `peer_${verdict.reason}`, "Connected peer address is not public");
   }

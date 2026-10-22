@@ -9,9 +9,15 @@ An auditable, read-only research browsing service exposed through the Model Cont
 Implemented:
 
 - `src/index.ts` — MCP stdio server exposing the five `research.*` tools.
-- `src/security.ts` — URL policy, IPv4/IPv6 special-purpose range filtering (including IPv4-mapped, NAT64, 6to4 and cloud metadata), redaction, challenge classification, declared-basis SHA-256.
+- `src/security.ts` — URL policy and a destination-address **allowlist**. An address passes only if it is global unicast (IPv4 below `224.0.0.0`, IPv6 inside `2000::/3`) and outside every special-purpose block (private, loopback, link-local, NAT64, 6to4, Teredo, documentation, cloud metadata, …). Anything else, e.g. `4000::1`, is denied as `not_global_unicast`. One policy function judges IP-literal URLs, every DNS answer and the connected peer, always on the canonical address spelling. Also redaction, challenge classification, declared-basis SHA-256.
 - `src/fetcher.ts` — read-only fetch with per-hop validation: URL policy → validate **every** DNS answer → connect through a pinned `lookup` that only returns the validated IP (no second DNS query, so no rebinding window) → verify the kernel-reported peer address at `connect`, before any request or TLS bytes are sent → bounded wire bytes, decoded bytes (gzip/deflate/br bombs), redirects, loops, text and total time. TLS verification is always on; no proxy, cookies, or caller headers are used.
-- `src/handoff.ts` — pause/resume contract. Without a host-configured `HostEventVerifier`, resume always defers to the host. With one, it checks task, pause, URL, expiry, version drift and idempotency.
+- `src/handoff.ts` — pause/resume contract. Without a host-configured `HostEventVerifier`, resume always defers to the host. With one, it checks:
+  - task, pause and URL binding;
+  - the event's time order: RFC 3339 timestamps with an explicit offset, and pause time ≤ `issued_at` ≤ now < `expires_at`;
+  - version drift;
+  - idempotency.
+
+  Any rejection leaves the task `BLOCKED` and the pause unconsumed. Pause records never keep the raw URL. They keep a display form without userinfo, fragment or query values, and an HMAC of the canonical URL; event URLs are compared against that HMAC.
 - `src/search.ts` — provider allowlist from startup configuration only. No provider is enabled by default.
 
 Development uses npm (`package-lock.json`) and Node.js 22:
@@ -25,7 +31,9 @@ npm run build && npm start
 
 Known gaps:
 
-- Address filtering in the process is not a substitute for deployment-level egress controls (network policy / firewall). It does not cover IPv6 extension or tunnelling formats beyond those listed in `security.ts`.
+- Address filtering in the process is not a substitute for deployment-level egress controls (network policy / firewall).
+- The IPv6 allowlist is all of `2000::/3` minus the listed special-purpose blocks. Unallocated parts of it are allowed; they are unroutable. A NAT64 gateway that uses a network-specific prefix inside `2000::/3` is not detected. A new IANA special-purpose block inside `2000::/3` needs a code change; one outside it is denied automatically.
+- Handoff display URLs keep the path, so a secret embedded in a path segment would still be shown there. Event times are compared with zero clock-skew tolerance, so the host's and this service's clocks must agree.
 - The DNS-rebinding tests use an injected resolver and loopback fixtures. They have not been run in a controlled network sandbox with a real authoritative DNS server.
 - No durable evidence sink: results report `evidence_persisted: false`. Handoff records are in memory only.
 - No search provider is enabled. Robots.txt is not consulted yet.
