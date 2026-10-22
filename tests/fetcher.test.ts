@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
-import type { AddressInfo } from "node:net";
+import net, { type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
@@ -452,6 +452,32 @@ describe("https", { skip: !hasOpenssl() && "openssl not available" }, () => {
   it("refuses an untrusted certificate", async () => {
     const r = await fetchPublicPage(`https://fixture.test:${tlsPort}/`, policy({ allowedPorts: new Set([tlsPort]) }), deps());
     expectStatus(r, "policy_denied", "tls_verification_failed");
+  });
+
+  it("aborts before the TLS ClientHello when the connected peer fails the policy", async () => {
+    // A raw TCP listener records every byte it receives; the client must send none.
+    let received = 0;
+    let closed!: Promise<void>;
+    const raw = net.createServer((s) => {
+      closed = new Promise((r) => s.on("close", () => r()));
+      s.on("data", (d) => (received += d.length));
+      s.on("error", () => {});
+    });
+    await new Promise<void>((r) => raw.listen(0, "127.0.0.1", r));
+    const rawPort = (raw.address() as AddressInfo).port;
+    try {
+      let checks = 0;
+      const r = await fetchPublicPage(
+        `https://fixture.test:${rawPort}/`,
+        policy({ allowedPorts: new Set([rawPort]), isAddressAllowed: (ip) => (++checks === 1 ? fixtureOnly(ip) : { allowed: false, reason: "test_peer" }) }),
+        deps({ tlsCa: ca }),
+      );
+      expectStatus(r, "policy_denied", "peer_test_peer");
+      await closed;
+      assert.equal(received, 0, "no TLS bytes may reach the peer");
+    } finally {
+      raw.close();
+    }
   });
 
   it("refuses a certificate for a different host name", async () => {

@@ -30,7 +30,8 @@ export interface SearchResult {
 
 const PROTECTED_DATA = [
   /\b\d{3}-\d{2}-\d{4}\b/, // SSN-like
-  /\b(mrn|medical record( number)?|patient id)\s*[:#]?\s*\w+/i,
+  // Requires an actual numeric identifier, so research about record systems still passes.
+  /\b(mrn|medical record(?: number| no\.?)?|patient id)\b[\s:#.=-]*[a-z]{0,4}-?\d{3,}/i,
   /\b(api[_-]?key|password|passwd|secret|bearer)\s*[:=]\s*\S+/i,
   /\bsk-[A-Za-z0-9]{16,}\b|\bgh[pousr]_[A-Za-z0-9]{20,}\b|\bAKIA[0-9A-Z]{16}\b/,
 ];

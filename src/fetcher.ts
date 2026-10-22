@@ -222,10 +222,10 @@ function requestHop(url: URL, hostname: string, port: number, pinned: ResolvedAd
           fail(err);
         }
       };
-      // TLSSocket and net.Socket both emit "connect" once TCP is up, before any
-      // request bytes (or the TLS ClientHello) are written.
+      // Prepended so it runs before tls.connect's own "connect" listener, which
+      // starts the handshake: a rejected peer gets no ClientHello and no request bytes.
       if (socket.remoteAddress) check();
-      else socket.once("connect", check);
+      else socket.prependOnceListener("connect", check);
     });
     req.on("timeout", () => fail(new FetchStop("timeout", "connect_timeout", "Connection timed out")));
     req.on("error", (err) => fail(err));

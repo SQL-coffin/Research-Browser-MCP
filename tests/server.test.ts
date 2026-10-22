@@ -74,6 +74,16 @@ describe("MCP surface", () => {
 });
 
 describe("ProviderRegistry", () => {
+  it("blocks record identifiers but not research about record systems (RB-19)", async () => {
+    const reg = new ProviderRegistry([{ id: "fake", version: "1", search: async () => [] }]);
+    for (const q of ["medical record number standards HL7", "patient id matching algorithms", "MRN reconciliation"]) {
+      assert.equal((await reg.search(q, 3, undefined)).status, "success", q);
+    }
+    for (const q of ["patient MRN: 12345 outcomes", "Medical Record #: 0012345", "medical record no. 55512", "patient id 4471203", "api_key=sk-abc", "ssn 123-45-6789"]) {
+      assert.equal((await reg.search(q, 3, undefined)).status, "policy_denied", q);
+    }
+  });
+
   it("uses a configured provider and never falls back on failure", async () => {
     const ok: SearchProvider = { id: "fake", version: "1", search: async () => [{ title: "T", url: "https://example.org", source: {} }] };
     const broken: SearchProvider = { id: "broken", version: "1", search: async () => { throw new Error("x"); } };
