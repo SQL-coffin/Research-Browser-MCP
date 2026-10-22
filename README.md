@@ -4,7 +4,30 @@ An auditable, read-only research browsing service exposed through the Model Cont
 
 ## Status
 
-**Phase 0 — design-first.** This repository is currently an architecture/specification starting point. A document in this repository does not imply that a browser adapter, provider, or safety control has already been implemented.
+**Phase 1 — bounded fetcher and handoff contract, local fixtures only.** Not yet production-ready; see "Known gaps" below.
+
+Implemented:
+
+- `src/index.ts` — MCP stdio server exposing the five `research.*` tools.
+- `src/security.ts` — URL policy, IPv4/IPv6 special-purpose range filtering (including IPv4-mapped, NAT64, 6to4 and cloud metadata), redaction, challenge classification, declared-basis SHA-256.
+- `src/fetcher.ts` — read-only fetch with per-hop validation: URL policy → validate **every** DNS answer → connect through a pinned `lookup` that only returns the validated IP (no second DNS query, so no rebinding window) → verify the kernel-reported peer address at `connect`, before any request or TLS bytes are sent → bounded wire bytes, decoded bytes (gzip/deflate/br bombs), redirects, loops, text and total time. TLS verification is always on; no proxy, cookies, or caller headers are used.
+- `src/handoff.ts` — pause/resume contract. Without a host-configured `HostEventVerifier`, resume always defers to the host. With one, it checks task, pause, URL, expiry, version drift and idempotency.
+- `src/search.ts` — provider allowlist from startup configuration only. No provider is enabled by default.
+
+```bash
+npm install
+npm test          # node:test against local HTTP/HTTPS fixtures; no third-party sites
+npm run typecheck
+npm run build && npm start
+```
+
+Known gaps:
+
+- Address filtering in the process is not a substitute for deployment-level egress controls (network policy / firewall). It does not cover IPv6 extension or tunnelling formats beyond those listed in `security.ts`.
+- The DNS-rebinding tests use an injected resolver and loopback fixtures. They have not been run in a controlled network sandbox with a real authoritative DNS server.
+- No durable evidence sink: results report `evidence_persisted: false`. Handoff records are in memory only.
+- No search provider is enabled. Robots.txt is not consulted yet.
+- Text extraction is regex-based and is not a full HTML parser.
 
 ## Goals
 
