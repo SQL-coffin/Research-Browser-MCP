@@ -5,8 +5,10 @@ import {
   classifyAddress,
   classifyChallenge,
   DEFAULT_URL_POLICY,
+  discloseUrl,
   HostAllowlistError,
   isHostAllowlistEmpty,
+  ORIGIN_ONLY,
   parseHostAllowlist,
   redactHeaders,
   redactUrl,
@@ -169,7 +171,7 @@ describe("validateUrl (RB-02, RB-06)", () => {
 });
 
 describe("host allowlist (startup configuration)", () => {
-  const list = parseHostAllowlist("Example.ORG., *.Wiki.Example.NET, bücher.example, 93.184.215.14, [2606:4700:4700::1111]");
+  const list = parseHostAllowlist("Example.ORG., bücher.example, 93.184.215.14, [2606:4700:4700::1111]");
   const verdict = (url: string) => {
     const r = validateUrl(url, { ...DEFAULT_URL_POLICY, allowedHosts: list });
     return r.ok ? "ok" : r.code;
@@ -177,7 +179,6 @@ describe("host allowlist (startup configuration)", () => {
 
   it("normalizes entries: case, trailing dot, IDN to Punycode, canonical IP spelling", () => {
     assert.deepEqual([...list.exact].sort(), ["2606:4700:4700:0:0:0:0:1111", "93.184.215.14", "example.org", "xn--bcher-kva.example"]);
-    assert.deepEqual(list.subdomainsOf, ["wiki.example.net"]);
   });
 
   it("is empty when unset, and an empty allowlist denies everything", () => {
@@ -186,13 +187,17 @@ describe("host allowlist (startup configuration)", () => {
     assert.ok(!r.ok && r.code === "host_allowlist_empty");
   });
 
+  // Wildcards are not supported in any form.
+  for (const entry of ["*", "*.org", "*.co.uk", "*.example.org", "*.example.org.", "*.*", "**.example.org", "a.*.example.org", "*example.org", "example.*", "%2A.example.org"]) {
+    it(`rejects the wildcard entry ${JSON.stringify(entry)}`, () => {
+      assert.throws(
+        () => parseHostAllowlist(`example.com, ${entry}`),
+        (err: unknown) => err instanceof HostAllowlistError && /position 2\b/.test(err.message) && /wildcards, .* are not supported/.test(err.message),
+      );
+    });
+  }
+
   for (const entry of [
-    "*",
-    "*.org",
-    "*.*",
-    "**.example.org",
-    "a.*.example.org",
-    "*example.org",
     "https://example.org",
     "example.org/path",
     "example.org:443",
@@ -229,8 +234,6 @@ describe("host allowlist (startup configuration)", () => {
     "https://bücher.example/",
     "https://BÜCHER.example/",
     "https://xn--bcher-kva.example/",
-    "https://en.wiki.example.net/",
-    "https://en.m.wiki.example.net/",
     "https://93.184.215.14/",
     "https://[2606:4700:4700:0:0:0:0:1111]/",
   ]) {
@@ -239,14 +242,14 @@ describe("host allowlist (startup configuration)", () => {
 
   for (const url of [
     "https://example.com/",
-    "https://www.example.org/", // a subdomain of an exact entry
+    "https://www.example.org/", // a subdomain of a listed host
+    "https://a.b.example.org/",
+    "https://sub.bücher.example/",
     "https://example.org.evil.com/",
     "https://evilexample.org/",
     "https://example.org%2eevil.com/", // percent-encoded dot
     "https://example.org．evil.com/", // fullwidth dot
     "https://exаmple.org/", // Cyrillic "а": xn--exmple-4nf.org
-    "https://wiki.example.net/", // the parent of a wildcard entry
-    "https://xwiki.example.net/", // no label boundary
     "https://93.184.215.15/",
     "https://[2606:4700:4700::1112]/",
     "https://8.8.8.8/",
@@ -254,10 +257,10 @@ describe("host allowlist (startup configuration)", () => {
     it(`denies ${url} as not allowlisted`, () => assert.equal(verdict(url), "host_not_allowlisted"));
   }
 
-  it("rejects malformed host names that a wildcard entry would otherwise match", () => {
-    assert.equal(verdict("https://.wiki.example.net/"), "invalid_host");
-    assert.equal(verdict("https://*.wiki.example.net/"), "invalid_host");
-    assert.equal(verdict("https://a..wiki.example.net/"), "invalid_host");
+  it("rejects malformed host names before they reach the allowlist or DNS", () => {
+    assert.equal(verdict("https://.example.org/"), "invalid_host");
+    assert.equal(verdict("https://*.example.org/"), "invalid_host");
+    assert.equal(verdict("https://a..example.org/"), "invalid_host");
   });
 
   it("only narrows the other checks: a listed host still needs a public name and address, https and port 443", () => {
@@ -271,6 +274,50 @@ describe("host allowlist (startup configuration)", () => {
     assert.equal(code("http://example.org/"), "scheme_not_allowed");
     assert.equal(code("https://example.org:8443/"), "port_not_allowed");
     assert.equal(code("https://user:pw@example.org/"), "url_credentials");
+  });
+});
+
+describe("URL disclosure in fetch results (output only)", () => {
+  const RAW = "https://alice-U:pa55-Wd@Example.ORG/acct/PATH-T0KEN-z1?id=ID-77&token=QTOKEN-k2#frag-F3";
+  const optedIn = { fullUrlHosts: parseHostAllowlist("example.org bücher.example 2606:4700:4700::1111") };
+
+  it("shows only the origin by default", () => {
+    assert.equal(discloseUrl(RAW, ORIGIN_ONLY), "https://example.org");
+    assert.equal(discloseUrl("http://fixture.test:8080/a/PATH-T0KEN?c=d", ORIGIN_ONLY), "http://fixture.test:8080");
+  });
+
+  it("shows path and query for an opted-in host, never credentials or the fragment, and masks secret-looking values", () => {
+    assert.equal(discloseUrl(RAW, optedIn), "https://example.org/acct/PATH-T0KEN-z1?id=ID-77&token=REDACTED");
+  });
+
+  it("decides by each URL's own host, normalized exactly as the allowlist normalizes it", () => {
+    for (const listed of [
+      "https://EXAMPLE.org/p?q=1",
+      "https://example.org./p?q=1",
+      "https://ｅｘａｍｐｌｅ.org/p?q=1",
+      "https://BÜCHER.example/p?q=1",
+      "https://xn--bcher-kva.example/p?q=1",
+      "https://[2606:4700:4700:0:0:0:0:1111]/p?q=1",
+    ]) {
+      assert.match(discloseUrl(listed, optedIn), /\/p\?q=1$/, listed);
+    }
+    for (const [unlisted, origin] of [
+      ["https://www.example.org/p?q=1", "https://www.example.org"],
+      ["https://example.org.evil.com/p?q=1", "https://example.org.evil.com"],
+      ["https://example.com/p?q=1", "https://example.com"],
+      ["https://[2606:4700:4700::1112]/p?q=1", "https://[2606:4700:4700::1112]"],
+    ]) {
+      assert.equal(discloseUrl(unlisted!, optedIn), origin, unlisted);
+    }
+  });
+
+  it("returns placeholders for input it cannot show", () => {
+    assert.equal(discloseUrl("not a url", optedIn), "[unparseable-url]");
+    assert.equal(discloseUrl("file:///etc/passwd", optedIn), "[non-http-url]");
+  });
+
+  it("takes its host list with the same rules as the allowlist: no wildcards", () => {
+    assert.throws(() => parseHostAllowlist("*.example.org", "RESEARCH_BROWSER_FULL_URL_HOSTS"), /RESEARCH_BROWSER_FULL_URL_HOSTS: invalid entry at position 1/);
   });
 });
 

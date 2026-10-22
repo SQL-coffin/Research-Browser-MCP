@@ -5,7 +5,7 @@ import { after, before, describe, it } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { DEFAULT_FETCH_POLICY, type FetchDeps } from "../src/fetcher.js";
-import { ALLOWED_HOSTS_ENV, createServer, fetchPolicyFromEnv, type ServerOptions } from "../src/index.js";
+import { ALLOWED_HOSTS_ENV, createServer, disclosureFromEnv, fetchPolicyFromEnv, FULL_URL_HOSTS_ENV, type ServerOptions } from "../src/index.js";
 import { ProviderRegistry, type SearchProvider } from "../src/search.js";
 import { classifyAddress, HostAllowlistError, isHostAllowlistEmpty, parseHostAllowlist } from "../src/security.js";
 
@@ -91,6 +91,20 @@ describe("MCP surface", () => {
     assert.equal(other.error.code, "host_not_allowlisted");
   });
 
+  it("shows full URLs only for hosts opted in through RESEARCH_BROWSER_FULL_URL_HOSTS, with the same outcome", async () => {
+    const env = { [ALLOWED_HOSTS_ENV]: "evil.example", [FULL_URL_HOSTS_ENV]: "evil.example" };
+    const optedIn = await connect({ fetchPolicy: fetchPolicyFromEnv(env), disclosure: disclosureFromEnv(env), fetchDeps: loopbackDeps });
+    const plain = await connect({ fetchPolicy: fetchPolicyFromEnv(env), fetchDeps: loopbackDeps });
+    const target = "https://evil.example/acct/PATH-T0KEN-8m?token=QTOKEN-4r&id=ID-2p";
+    const full = await optedIn.call("research.fetch_public_page", { url: target });
+    const origin = await plain.call("research.fetch_public_page", { url: target });
+    assert.equal(full.source_url, "https://evil.example/acct/PATH-T0KEN-8m?token=REDACTED&id=ID-2p");
+    assert.equal(origin.source_url, "https://evil.example");
+    // Disclosure is output only: the address policy refuses loopback either way.
+    assert.equal(full.error.code, "address_loopback");
+    assert.equal(origin.error.code, "address_loopback");
+  });
+
   it("classifies an observation and reports only its origin", async () => {
     const r = await call("research.inspect_challenge", {
       observation: { source_url: "https://u:pw@example.org/acct/PATH-T0KEN-3fd?token=QTOKEN-9s#frag", http_status: 429, retry_after: "10" },
@@ -101,7 +115,7 @@ describe("MCP surface", () => {
     for (const secret of ["PATH-T0KEN-3fd", "QTOKEN-9s", "pw@", "frag"]) assert.ok(!JSON.stringify(r).includes(secret), secret);
   });
 
-  it("reports only the origin when classifying a fetched page by reference", async () => {
+  it("reports only the origin when classifying a fetched page by reference, even for an opted-in host", async () => {
     const fixture = http.createServer((_req, res) => {
       res.writeHead(429, { "content-type": "text/html", "retry-after": "5" });
       res.end("slow down");
@@ -117,10 +131,12 @@ describe("MCP surface", () => {
           allowedHosts: parseHostAllowlist("fixture.test"),
           isAddressAllowed: (ip) => (ip === "127.0.0.1" ? ({ allowed: true } as const) : classifyAddress(ip)),
         },
+        disclosure: { fullUrlHosts: parseHostAllowlist("fixture.test") },
         fetchDeps: loopbackDeps,
       });
       const fetched = await local.call("research.fetch_public_page", { url: `http://fixture.test:${port}/acct/PATH-T0KEN-7hk?token=QTOKEN-2x` });
       assert.equal(fetched.status, "rate_limited");
+      assert.equal(fetched.final_url, `http://fixture.test:${port}/acct/PATH-T0KEN-7hk?token=REDACTED`, "the fetch result itself is opted in");
       const r = await local.call("research.inspect_challenge", { fetch_request_id: fetched.request_id });
       assert.equal(r.challenge_type, "rate_limited");
       assert.equal(r.source_url, `http://fixture.test:${port}`);
@@ -162,14 +178,33 @@ describe("startup configuration", () => {
     }
   });
 
-  it("reads exact and wildcard entries", () => {
-    const p = fetchPolicyFromEnv({ [ALLOWED_HOSTS_ENV]: "Example.org, *.wiki.example.net" });
-    assert.deepEqual([...p.allowedHosts.exact], ["example.org"]);
-    assert.deepEqual(p.allowedHosts.subdomainsOf, ["wiki.example.net"]);
+  it("reads exact entries and rejects every wildcard form", () => {
+    const p = fetchPolicyFromEnv({ [ALLOWED_HOSTS_ENV]: "Example.org, 93.184.215.14" });
+    assert.deepEqual([...p.allowedHosts.exact], ["example.org", "93.184.215.14"]);
+    for (const wildcard of ["*.example.org", "*.co.uk", "*"]) {
+      assert.throws(
+        () => fetchPolicyFromEnv({ [ALLOWED_HOSTS_ENV]: `example.org, ${wildcard}` }),
+        (err: unknown) => err instanceof HostAllowlistError && err.message.startsWith(`${ALLOWED_HOSTS_ENV}: invalid entry at position 2`),
+      );
+    }
   });
 
   it("refuses to build a policy from an invalid entry", () => {
-    assert.throws(() => fetchPolicyFromEnv({ [ALLOWED_HOSTS_ENV]: "example.org, *" }), HostAllowlistError);
+    assert.throws(() => fetchPolicyFromEnv({ [ALLOWED_HOSTS_ENV]: "example.org, https://example.com/" }), HostAllowlistError);
+  });
+
+  it("shows origins only when RESEARCH_BROWSER_FULL_URL_HOSTS is unset or empty", () => {
+    for (const env of [{}, { [FULL_URL_HOSTS_ENV]: "" }]) assert.ok(isHostAllowlistEmpty(disclosureFromEnv(env).fullUrlHosts));
+  });
+
+  it("reads full-URL hosts with the same rules and keeps them out of the fetch policy", () => {
+    const env = { [FULL_URL_HOSTS_ENV]: "Arxiv.org" };
+    assert.deepEqual([...disclosureFromEnv(env).fullUrlHosts.exact], ["arxiv.org"]);
+    assert.ok(isHostAllowlistEmpty(fetchPolicyFromEnv(env).allowedHosts), "opting in to full URLs allows no fetching");
+    assert.throws(
+      () => disclosureFromEnv({ [FULL_URL_HOSTS_ENV]: "*.arxiv.org" }),
+      (err: unknown) => err instanceof HostAllowlistError && err.message.startsWith(`${FULL_URL_HOSTS_ENV}: invalid entry at position 1`),
+    );
   });
 });
 

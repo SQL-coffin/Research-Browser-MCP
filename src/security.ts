@@ -177,18 +177,19 @@ export function checkAddress(ip: string, policy: Pick<UrlPolicy, "isAddressAllow
 }
 
 // ---------------------------------------------------------------------------
-// Host allowlist (startup configuration only)
+// Host lists (startup configuration only)
 // ---------------------------------------------------------------------------
 
+/**
+ * Exact hosts from startup configuration: normalized host names and canonical
+ * IP addresses. There are no wildcards; every host is listed by name.
+ */
 export interface HostAllowlist {
-  /** Normalized host names and canonical IP addresses; matched exactly. */
   readonly exact: ReadonlySet<string>;
-  /** Parents from "*.parent" entries: any strict subdomain matches, the parent itself does not. */
-  readonly subdomainsOf: readonly string[];
 }
 
 /** The default: nothing may be fetched until hosts are configured at startup. */
-export const EMPTY_HOST_ALLOWLIST: HostAllowlist = { exact: new Set(), subdomainsOf: [] };
+export const EMPTY_HOST_ALLOWLIST: HostAllowlist = { exact: new Set() };
 
 export class HostAllowlistError extends Error {}
 
@@ -206,8 +207,9 @@ function isValidHostName(host: string): boolean {
  * Returns null unless the result is a valid multi-label host name.
  */
 function normalizeHostEntry(entry: string): string | null {
-  // A scheme, port, path, userinfo, IPv6 literal or percent-escape means this is not a bare host name.
-  if (!entry || /[/\\?#@:%[\]]/.test(entry)) return null;
+  // A scheme, port, path, userinfo, IPv6 literal, percent-escape or wildcard means
+  // this is not one exact host name.
+  if (!entry || /[/\\?#@:%[\]*]/.test(entry)) return null;
   let host: string;
   try {
     host = new URL(`https://${entry}/`).hostname.replace(/\.$/, "");
@@ -218,53 +220,54 @@ function normalizeHostEntry(entry: string): string | null {
 }
 
 /**
- * Parses the startup host allowlist. Entries are separated by commas or whitespace:
- *   example.org     exactly this host, after normalization (case, trailing dot, IDN to Punycode)
- *   *.example.org   any subdomain of example.org at a label boundary, but not example.org itself
- *   93.184.215.14, 2606:4700::1111 or [2606:4700::1111]   exactly this IP address
- * "*.org" and other single-label parents are rejected. Invalid entries throw
- * HostAllowlistError, which names their positions but not their text, since a
- * misplaced URL could carry credentials.
+ * Parses a startup host list. Entries are separated by commas or whitespace, and
+ * each names exactly one host:
+ *   example.org   this host, after normalization (case, trailing dot, IDN to Punycode)
+ *   93.184.215.14, 2606:4700::1111 or [2606:4700::1111]   this IP address
+ * Wildcards ("*.example.org", "*.co.uk", ...) are not supported and are rejected
+ * like any other invalid entry. Invalid entries throw HostAllowlistError, which
+ * names their positions but not their text, since a misplaced URL could carry
+ * credentials. `name` labels the error, e.g. with the environment variable.
  */
-export function parseHostAllowlist(spec: string): HostAllowlist {
+export function parseHostAllowlist(spec: string, name = "host allowlist"): HostAllowlist {
   const exact = new Set<string>();
-  const subdomainsOf = new Set<string>();
   const invalid: number[] = [];
   spec
     .split(/[\s,]+/)
     .filter(Boolean)
     .forEach((entry, i) => {
       const ip = entry.replace(/^\[(.*)\]$/, "$1");
-      if (entry.startsWith("*.")) {
-        const parent = normalizeHostEntry(entry.slice(2));
-        if (parent) subdomainsOf.add(parent);
-        else invalid.push(i + 1);
-      } else if (isIP(ip)) {
-        exact.add(canonicalAddress(ip)!);
-      } else {
-        const host = normalizeHostEntry(entry);
-        if (host) exact.add(host);
-        else invalid.push(i + 1);
-      }
+      const host = isIP(ip) ? canonicalAddress(ip) : normalizeHostEntry(entry);
+      if (host) exact.add(host);
+      else invalid.push(i + 1);
     });
   if (invalid.length > 0) {
     throw new HostAllowlistError(
-      `Invalid host allowlist entr${invalid.length === 1 ? "y" : "ies"} at position ${invalid.join(", ")}. ` +
-        'Use bare host names ("example.org"), "*.example.org" for subdomains, or IP addresses; no scheme, port, path or credentials.',
+      `${name}: invalid entr${invalid.length === 1 ? "y" : "ies"} at position ${invalid.join(", ")}. ` +
+        'Use exact host names ("example.org") or IP addresses; wildcards, schemes, ports, paths and credentials are not supported.',
     );
   }
-  return { exact, subdomainsOf: [...subdomainsOf] };
+  return { exact };
 }
 
 export function isHostAllowlistEmpty(allowlist: HostAllowlist): boolean {
-  return allowlist.exact.size === 0 && allowlist.subdomainsOf.length === 0;
+  return allowlist.exact.size === 0;
 }
 
-/** `host` must be a normalized host name (as validateUrl produces) or a canonical IP address. */
+/** `host` must be a key from hostKey: a normalized host name or a canonical IP address. */
 export function isHostAllowlisted(host: string, allowlist: HostAllowlist): boolean {
-  if (allowlist.exact.has(host)) return true;
-  // Wildcards cover host names only, and match only below a label boundary.
-  return !isIP(host) && allowlist.subdomainsOf.some((parent) => host.endsWith(`.${parent}`));
+  return allowlist.exact.has(host);
+}
+
+/**
+ * How host lists key a URL's host: lower case, without the trailing dot, and IP
+ * addresses in canonical form. Used for both the fetch allowlist and URL
+ * disclosure, so the two always agree on which host a URL names.
+ */
+function hostKey(urlHostname: string): string {
+  const hostname = urlHostname.toLowerCase().replace(/\.$/, "");
+  const bare = hostname.replace(/^\[|\]$/g, "");
+  return isIP(bare) ? canonicalAddress(bare)! : hostname;
 }
 
 // ---------------------------------------------------------------------------
@@ -332,17 +335,17 @@ export function validateUrl(raw: string, policy: UrlPolicy = DEFAULT_URL_POLICY)
     if (!verdict.allowed) {
       return { ok: false, status: "policy_denied", code: `address_${verdict.reason}`, message: "Destination address is not public" };
     }
-    return allowlistDenial(canonicalAddress(bare)!, policy.allowedHosts) ?? { ok: true, url, hostname: bare, port, ipLiteral: bare };
+    return allowlistDenial(hostKey(url.hostname), policy.allowedHosts) ?? { ok: true, url, hostname: bare, port, ipLiteral: bare };
   }
   if (hostname === "localhost" || BLOCKED_HOST_SUFFIXES.some((s) => hostname.endsWith(s)) || !hostname.includes(".")) {
     return { ok: false, status: "policy_denied", code: "host_not_public", message: "Host name is not a public DNS name" };
   }
   // The URL parser accepts names such as ".example.org" or "*.example.org"; neither
-  // may reach DNS or match a "*.example.org" allowlist entry.
+  // may reach DNS.
   if (!isValidHostName(hostname)) {
     return { ok: false, status: "invalid_input", code: "invalid_host", message: "Host name is malformed" };
   }
-  return allowlistDenial(hostname, policy.allowedHosts) ?? { ok: true, url, hostname, port, ipLiteral: null };
+  return allowlistDenial(hostKey(url.hostname), policy.allowedHosts) ?? { ok: true, url, hostname, port, ipLiteral: null };
 }
 
 function allowlistDenial(host: string, allowlist: HostAllowlist): UrlCheck | null {
@@ -370,10 +373,10 @@ const SENSITIVE_PARAM =
 /**
  * Display-safe URL.
  *   "display": drops userinfo and fragment and masks the values of query parameters
- *              whose names look secret-bearing. Keeps the path: fetch results need
- *              it to identify the evidence.
- *   "origin":  scheme, host and port only, for logs, handoff records and challenge
- *              reports, since a path segment can carry a secret too.
+ *              whose names look secret-bearing. Keeps the path. Fetch results use
+ *              it only for hosts opted in through UrlDisclosure.
+ *   "origin":  scheme, host and port only. The default for every URL output, since
+ *              a path segment or an innocuously named parameter can carry a secret.
  */
 export function redactUrl(raw: string, mode: "display" | "origin" = "display"): string {
   let url: URL;
@@ -392,6 +395,38 @@ export function redactUrl(raw: string, mode: "display" | "origin" = "display"): 
   }
   url.search = params.toString();
   return url.toString();
+}
+
+// ---------------------------------------------------------------------------
+// URL disclosure in fetch results (output only)
+// ---------------------------------------------------------------------------
+
+/**
+ * How much of each URL a fetch result may show. Output only: no network check
+ * reads it, so it cannot change which hosts are fetched, how they are validated
+ * or connected to, or where redirects may lead.
+ */
+export interface UrlDisclosure {
+  /** Hosts whose URLs are shown with path and query; every other URL is shown as its origin. */
+  readonly fullUrlHosts: HostAllowlist;
+}
+
+/** The default: every URL in a fetch result is shown as its origin only. */
+export const ORIGIN_ONLY: UrlDisclosure = { fullUrlHosts: EMPTY_HOST_ALLOWLIST };
+
+/**
+ * The form of `raw` a fetch result may show, decided by the URL's own host: the
+ * "display" form for an opted-in host (path and query; no userinfo or fragment;
+ * secret-looking query values masked), otherwise the origin.
+ */
+export function discloseUrl(raw: string, disclosure: UrlDisclosure): string {
+  let host: string;
+  try {
+    host = hostKey(new URL(raw).hostname);
+  } catch {
+    return "[unparseable-url]";
+  }
+  return redactUrl(raw, isHostAllowlisted(host, disclosure.fullUrlHosts) ? "display" : "origin");
 }
 
 const SENSITIVE_HEADERS = new Set([

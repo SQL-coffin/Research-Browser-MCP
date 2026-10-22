@@ -11,11 +11,14 @@ import {
   classifyChallenge,
   DEFAULT_URL_POLICY,
   redactHeaders,
+  discloseUrl,
+  ORIGIN_ONLY,
   redactUrl,
   sha256,
   validateUrl,
   type ChallengeResult,
   type ContentHash,
+  type UrlDisclosure,
   type UrlPolicy,
 } from "./security.js";
 import { newRequestId, stderrAuditLogger, TOOL_VERSION, toolError, type AuditLogger, type Status, type ToolError } from "./result.js";
@@ -69,6 +72,7 @@ export const DEFAULT_FETCH_DEPS: FetchDeps = {
 };
 
 export interface RedirectHop {
+  /** As UrlDisclosure allows: the origin unless this hop's host is opted in to full URLs. */
   url: string;
   http_status: number;
   peer_address: string;
@@ -399,8 +403,16 @@ function statusFor(httpStatus: number, challenge: ChallengeResult): Status {
  * Bounded, read-only retrieval of a single public page. Every hop is validated
  * (URL policy -> DNS answers -> pinned connect -> peer check) before any request
  * bytes are sent. Callers cannot loosen the policy through tool input.
+ *
+ * `disclosure` only decides how URLs appear in the result (origin by default);
+ * nothing on the network path reads it.
  */
-export async function fetchPublicPage(rawUrl: string, policy: FetchPolicy = DEFAULT_FETCH_POLICY, deps: FetchDeps = DEFAULT_FETCH_DEPS): Promise<FetchResult> {
+export async function fetchPublicPage(
+  rawUrl: string,
+  policy: FetchPolicy = DEFAULT_FETCH_POLICY,
+  deps: FetchDeps = DEFAULT_FETCH_DEPS,
+  disclosure: UrlDisclosure = ORIGIN_ONLY,
+): Promise<FetchResult> {
   const requestId = newRequestId();
   const started = Date.now();
   const redirectChain: RedirectHop[] = [];
@@ -408,7 +420,7 @@ export async function fetchPublicPage(rawUrl: string, policy: FetchPolicy = DEFA
   const base = (): Base => ({
     request_id: requestId,
     tool_version: TOOL_VERSION,
-    source_url: redactUrl(rawUrl),
+    source_url: discloseUrl(rawUrl, disclosure),
     redirect_chain: redirectChain,
     warnings,
   });
@@ -435,7 +447,7 @@ export async function fetchPublicPage(rawUrl: string, policy: FetchPolicy = DEFA
         const location = res.headers.location;
         res.destroy();
         if (!location) throw new FetchStop("extraction_failed", "redirect_without_location", "Redirect response has no Location");
-        redirectChain.push({ url: redactUrl(key), http_status: httpStatus, peer_address: peer });
+        redirectChain.push({ url: discloseUrl(key, disclosure), http_status: httpStatus, peer_address: peer });
         if (redirectChain.length > policy.maxRedirects) throw new FetchStop("blocked", "too_many_redirects", "Redirect limit exceeded");
         try {
           current = new URL(location, check.url).toString();
@@ -473,7 +485,7 @@ export async function fetchPublicPage(rawUrl: string, policy: FetchPolicy = DEFA
       const result: FetchSuccess = {
         ...base(),
         status: status as FetchSuccess["status"],
-        final_url: redactUrl(key),
+        final_url: discloseUrl(key, disclosure),
         title,
         retrieved_at: deps.now().toISOString(),
         content_type: mime,

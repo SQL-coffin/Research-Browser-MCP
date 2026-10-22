@@ -16,9 +16,10 @@ import {
   type FetchDeps,
   type FetchPolicy,
   type FetchResult,
+  type FetchSuccess,
   type ResolvedAddress,
 } from "../src/fetcher.js";
-import { classifyAddress, parseHostAllowlist, validateUrl } from "../src/security.js";
+import { classifyAddress, ORIGIN_ONLY, parseHostAllowlist, validateUrl, type UrlDisclosure } from "../src/security.js";
 
 // ---------------------------------------------------------------------------
 // Local fixture server. The fetcher treats 127.0.0.1 as the ONLY "public"
@@ -416,19 +417,123 @@ describe("host allowlist: startup configuration, re-checked on every redirect", 
     assert.equal(seen.length, 6, "per hop: the DNS answer, the peer at connect, the peer at response");
   });
 
-  it("matches a wildcard entry for subdomains only, at a label boundary", async () => {
-    const wildcard = policy({ allowedHosts: parseHostAllowlist("*.sub.test") });
-    const c = countingDeps({ "a.sub.test": loopback, "deep.a.sub.test": loopback, "sub.test": loopback, "evilsub.test": loopback });
-    expectStatus(await fetchPublicPage(url("/allow-ok", "a.sub.test"), wildcard, c.deps), "success");
-    expectStatus(await fetchPublicPage(url("/allow-ok", "deep.a.sub.test"), wildcard, c.deps), "success");
-    expectStatus(await fetchPublicPage(url("/allow-ok", "sub.test"), wildcard, c.deps), "policy_denied", "host_not_allowlisted");
-    expectStatus(await fetchPublicPage(url("/allow-ok", "evilsub.test"), wildcard, c.deps), "policy_denied", "host_not_allowlisted");
-    assert.deepEqual(c.looked, ["a.sub.test", "deep.a.sub.test"]);
+  it("allows only the exact host listed: neither its subdomains nor its parent", async () => {
+    const exact = policy({ allowedHosts: parseHostAllowlist("a.sub.test") });
+    const c = countingDeps({ "a.sub.test": loopback, "deep.a.sub.test": loopback, "sub.test": loopback });
+    expectStatus(await fetchPublicPage(url("/allow-ok", "a.sub.test"), exact, c.deps), "success");
+    expectStatus(await fetchPublicPage(url("/allow-ok", "deep.a.sub.test"), exact, c.deps), "policy_denied", "host_not_allowlisted");
+    expectStatus(await fetchPublicPage(url("/allow-ok", "sub.test"), exact, c.deps), "policy_denied", "host_not_allowlisted");
+    assert.deepEqual(c.looked, ["a.sub.test"]);
   });
 
   it("does not replace the address policy: an allowlisted host that resolves privately is still denied", async () => {
     // private.test is on FIXTURE_HOSTS but resolves to 10.0.0.7.
     expectStatus(await fetchPublicPage(url("/allow-ok", "private.test"), policy(), deps()), "policy_denied", "address_private");
+  });
+});
+
+describe("URL disclosure in fetch results: origins unless opted in, output only", () => {
+  const SECRETS = ["PATH-T0KEN-a1", "QTOKEN-b2", "ID-c3", "frag-d4", "HOP-T0KEN-e5", "SID-f6"];
+  route("/acct/PATH-T0KEN-a1", (_req, res) => {
+    res.writeHead(302, { location: "/hop/HOP-T0KEN-e5?sid=SID-f6#frag" });
+    res.end();
+  });
+  route("/hop/HOP-T0KEN-e5", html("<title>Disclosure fixture</title>page body"));
+  route("/x-to-alias", (_req, res) => {
+    res.writeHead(302, { location: `http://alias.test:${port}/hop/HOP-T0KEN-e5?sid=SID-f6` });
+    res.end();
+  });
+  const tokenUrl = () => url("/acct/PATH-T0KEN-a1?token=QTOKEN-b2&id=ID-c3#frag-d4");
+  const optIn = (hosts: string): UrlDisclosure => ({ fullUrlHosts: parseHostAllowlist(hosts) });
+  const loop: ResolvedAddress[] = [{ address: "127.0.0.1", family: 4 }];
+
+  it("shows every URL as its origin by default, and keeps title, time, hash and request id", async () => {
+    const r = await fetchPublicPage(tokenUrl(), policy(), deps());
+    expectStatus(r, "success");
+    assert.ok("final_url" in r);
+    const origin = `http://fixture.test:${port}`;
+    assert.equal(r.source_url, origin);
+    assert.equal(r.final_url, origin);
+    assert.deepEqual(r.redirect_chain.map((h) => h.url), [origin]);
+    assert.equal(r.title, "Disclosure fixture");
+    assert.equal(r.retrieved_at, "2026-10-22T00:00:00.000Z");
+    assert.match(r.content_hash.value, /^[0-9a-f]{64}$/);
+    assert.match(r.request_id, /^[0-9a-f-]{36}$/);
+    const json = JSON.stringify(r);
+    for (const secret of SECRETS) assert.ok(!json.includes(secret), `result shows ${secret}`);
+  });
+
+  it("never shows credentials, even for an opted-in host", async () => {
+    for (const disclosure of [ORIGIN_ONLY, optIn("fixture.test")]) {
+      const r = await fetchPublicPage(`http://alice-U9:pa55-Wd7@fixture.test:${port}/acct/PATH-T0KEN-a1?token=QTOKEN-b2`, policy(), deps(), disclosure);
+      expectStatus(r, "policy_denied", "url_credentials");
+      for (const secret of ["alice-U9", "pa55-Wd7", "QTOKEN-b2"]) assert.ok(!JSON.stringify(r).includes(secret), secret);
+    }
+  });
+
+  it("shows path and query for an opted-in host, without fragments and with secret-looking values masked", async () => {
+    const r = await fetchPublicPage(tokenUrl(), policy(), deps(), optIn("fixture.test"));
+    expectStatus(r, "success");
+    assert.ok("final_url" in r);
+    assert.equal(r.source_url, url("/acct/PATH-T0KEN-a1?token=REDACTED&id=ID-c3"));
+    assert.deepEqual(r.redirect_chain.map((h) => h.url), [url("/acct/PATH-T0KEN-a1?token=REDACTED&id=ID-c3")]);
+    assert.equal(r.final_url, url("/hop/HOP-T0KEN-e5?sid=REDACTED"));
+    assert.ok(!JSON.stringify(r).includes("frag"));
+  });
+
+  it("decides per hop on a cross-domain redirect", async () => {
+    const both = policy({ allowedHosts: parseHostAllowlist("fixture.test alias.test") });
+    const loopDeps = () => deps({ resolve: async () => loop });
+    // fixture.test opted in, alias.test not: the redirect target shows only its origin.
+    const a = await fetchPublicPage(url("/x-to-alias?token=QTOKEN-b2"), both, loopDeps(), optIn("fixture.test"));
+    expectStatus(a, "success");
+    assert.ok("final_url" in a);
+    assert.deepEqual(a.redirect_chain.map((h) => h.url), [url("/x-to-alias?token=REDACTED")]);
+    assert.equal(a.final_url, `http://alias.test:${port}`);
+    for (const secret of ["HOP-T0KEN-e5", "SID-f6", "QTOKEN-b2"]) assert.ok(!JSON.stringify(a).includes(secret), secret);
+    // The reverse: alias.test opted in, fixture.test not.
+    const b = await fetchPublicPage(url("/x-to-alias?token=QTOKEN-b2"), both, loopDeps(), optIn("alias.test"));
+    expectStatus(b, "success");
+    assert.ok("final_url" in b);
+    assert.equal(b.source_url, `http://fixture.test:${port}`);
+    assert.deepEqual(b.redirect_chain.map((h) => h.url), [`http://fixture.test:${port}`]);
+    assert.equal(b.final_url, `http://alias.test:${port}/hop/HOP-T0KEN-e5?sid=REDACTED`);
+  });
+
+  it("changes nothing on the network: same checks, lookups, connections and outcome", async () => {
+    const run = async (disclosure: UrlDisclosure) => {
+      const looked: string[] = [];
+      const checked: string[] = [];
+      hits = [];
+      const r = (await fetchPublicPage(
+        tokenUrl(),
+        policy({ isAddressAllowed: (ip) => (checked.push(ip), fixtureOnly(ip)) }),
+        deps({ resolve: async (host) => (looked.push(host), loop) }),
+        disclosure,
+      )) as FetchSuccess;
+      // Everything except the URL strings and the per-call request id must match.
+      const { source_url: _s, final_url: _f, request_id: _id, redirect_chain, ...rest } = r;
+      return { rest, hops: redirect_chain.map(({ url: _u, ...hop }) => hop), looked, checked, hits: [...hits] };
+    };
+    const originOnly = await run(ORIGIN_ONLY);
+    assert.equal(originOnly.rest.status, "success");
+    assert.equal(originOnly.hits.length, 2, "both hops reached the fixture");
+    assert.ok(originOnly.looked.length === 2 && originOnly.checked.length === 6, "DNS and peer checks ran on both hops");
+    assert.deepEqual(await run(optIn("fixture.test")), originOnly);
+  });
+
+  it("does not let an opted-in host past the allowlist", async () => {
+    const looked: string[] = [];
+    const r = await fetchPublicPage(url("/acct/PATH-T0KEN-a1", "unlisted.test"), policy(), deps({ resolve: async (h) => (looked.push(h), loop) }), optIn("unlisted.test"));
+    expectStatus(r, "policy_denied", "host_not_allowlisted");
+    assert.deepEqual(looked, []);
+  });
+
+  it("keeps log lines at origins, even for an opted-in host", async () => {
+    logs.length = 0;
+    await fetchPublicPage(tokenUrl(), policy(), deps(), optIn("fixture.test"));
+    const text = JSON.stringify(logs);
+    for (const secret of SECRETS) assert.ok(!text.includes(secret), `log line contains ${secret}`);
   });
 });
 
@@ -447,8 +552,13 @@ describe("redirects (RB-04)", () => {
     expectStatus(r, "success");
     assert.ok("final_url" in r);
     assert.equal(r.redirect_chain.length, 2);
-    assert.equal(r.redirect_chain[1]!.url, url("/r2?token=REDACTED"));
-    assert.equal(r.final_url, url("/final"));
+    // Origins only by default; see "URL disclosure" for opted-in hosts.
+    assert.equal(r.redirect_chain[1]!.url, `http://fixture.test:${port}`);
+    assert.equal(r.final_url, `http://fixture.test:${port}`);
+    const full = await fetchPublicPage(url("/r1"), policy(), deps(), { fullUrlHosts: parseHostAllowlist("fixture.test") });
+    assert.ok("final_url" in full);
+    assert.equal(full.redirect_chain[1]!.url, url("/r2?token=REDACTED"));
+    assert.equal(full.final_url, url("/final"));
   });
 
   it("rejects a redirect to a private IP literal before connecting", async () => {

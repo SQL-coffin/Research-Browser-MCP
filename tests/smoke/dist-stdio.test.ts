@@ -150,15 +150,36 @@ describe("built server over stdio (dist/index.js)", () => {
     assert.doesNotMatch(s.stderr(), /is empty/);
   });
 
-  it("refuses to start with an invalid allowlist entry and leaves no process behind", TEST, async () => {
-    const s = start({ env: { RESEARCH_BROWSER_ALLOWED_HOSTS: "example.org, *" } });
+  it("shows full URLs only for hosts in RESEARCH_BROWSER_FULL_URL_HOSTS, without changing what is fetched", TEST, async () => {
+    const s = start({ env: { RESEARCH_BROWSER_ALLOWED_HOSTS: "example.org", RESEARCH_BROWSER_FULL_URL_HOSTS: "example.com" } });
     try {
-      await assert.rejects(withTimeout(s.ready, 10_000, "initialize"));
+      await withTimeout(s.ready, 10_000, "initialize");
+      // Both hosts are off the allowlist, so neither request reaches the network.
+      const optedIn = (await fetchVia(s.client, { url: "https://example.com/acct/PATH-T0KEN?token=QTOKEN" })) as { source_url?: string; error?: { code: string } };
+      const plain = (await fetchVia(s.client, { url: "https://example.net/acct/PATH-T0KEN?token=QTOKEN" })) as { source_url?: string; error?: { code: string } };
+      assert.equal(optedIn.error?.code, "host_not_allowlisted");
+      assert.equal(plain.error?.code, "host_not_allowlisted");
+      assert.equal(optedIn.source_url, "https://example.com/acct/PATH-T0KEN?token=REDACTED");
+      assert.equal(plain.source_url, "https://example.net");
     } finally {
       await s.stop();
     }
-    assert.match(s.stderr(), /Invalid host allowlist entry at position 2/);
   });
+
+  for (const [variable, value] of [
+    ["RESEARCH_BROWSER_ALLOWED_HOSTS", "example.org, *.co.uk"],
+    ["RESEARCH_BROWSER_FULL_URL_HOSTS", "example.org, *.example.org"],
+  ] as const) {
+    it(`refuses to start with a wildcard in ${variable} and leaves no process behind`, TEST, async () => {
+      const s = start({ env: { [variable]: value } });
+      try {
+        await assert.rejects(withTimeout(s.ready, 10_000, "initialize"));
+      } finally {
+        await s.stop();
+      }
+      assert.match(s.stderr(), new RegExp(`${variable}: invalid entry at position 2`));
+    });
+  }
 
   it("times out a server that never answers and kills it even though it ignores SIGTERM", TEST, async () => {
     // A stand-in for a hung server: it never answers initialize and ignores SIGTERM.
