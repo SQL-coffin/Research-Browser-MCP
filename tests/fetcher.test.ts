@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
@@ -19,6 +20,7 @@ import {
   type FetchSuccess,
   type ResolvedAddress,
 } from "../src/fetcher.js";
+import { FileEvidenceStore, type EvidenceSink } from "../src/evidence.js";
 import { classifyAddress, ORIGIN_ONLY, parseHostAllowlist, validateUrl, type UrlDisclosure } from "../src/security.js";
 
 // ---------------------------------------------------------------------------
@@ -753,6 +755,78 @@ describe("audit logging (RB-09)", () => {
       ],
     );
     assert.ok(logs.every((l) => typeof l.request_id === "string"));
+  });
+});
+
+describe("evidence persistence", () => {
+  let evidenceRoot: string;
+  before(() => {
+    evidenceRoot = mkdtempSync(join(tmpdir(), "rbmcp-fetch-evidence-"));
+  });
+  after(() => rmSync(evidenceRoot, { recursive: true, force: true }));
+
+  it("is disabled by default and says so", async () => {
+    route("/ev-default", html("<p>x</p>"));
+    const r = await fetchPublicPage(url("/ev-default"), policy(), deps());
+    expectStatus(r, "success");
+    assert.ok("evidence_status" in r);
+    assert.equal(r.evidence_status, "disabled");
+    assert.equal(r.evidence_persisted, false);
+    assert.equal(r.evidence_id, undefined);
+  });
+
+  it("stores the decoded body bytes, which hash to the declared content_hash", async () => {
+    const page = "<html><head><title>Gz</title></head><body><p>compressed evidence body</p></body></html>";
+    route("/ev-gzip", (_req, res) => {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-encoding": "gzip", "set-cookie": "sid=secret" });
+      res.end(zlib.gzipSync(page));
+    });
+    const store = new FileEvidenceStore(join(evidenceRoot, "a"));
+    const r = await fetchPublicPage(url("/ev-gzip?token=abc"), policy(), deps({ evidence: store }));
+    expectStatus(r, "success");
+    assert.ok("content_hash" in r);
+    assert.equal(r.evidence_status, "persisted");
+    assert.equal(r.evidence_persisted, true);
+    assert.match(r.evidence_id ?? "", /^[0-9a-f-]{36}$/);
+    const object = readFileSync(join(evidenceRoot, "a", "objects", "sha256", r.content_hash.value));
+    assert.equal(object.toString("utf8"), page, "the decompressed body is stored, not the gzip wire bytes");
+    assert.equal(createHash("sha256").update(object).digest("hex"), r.content_hash.value);
+    const record = readFileSync(join(evidenceRoot, "a", "records", `${r.evidence_id}.json`), "utf8");
+    assert.doesNotMatch(record, /ev-gzip|token|abc|sid=|secret/);
+    assert.match(record, /"http_status": 200/);
+  });
+
+  it("reports a failed write without claiming persistence and keeps the fetch result", async () => {
+    route("/ev-fail", html("<p>y</p>"));
+    const failing: EvidenceSink = { persist: async () => ({ evidence_status: "failed", evidence_persisted: false, evidence_error: { code: "evidence_write_failed", message: "x", retryable: false } }) };
+    const r = await fetchPublicPage(url("/ev-fail"), policy(), deps({ evidence: failing }));
+    expectStatus(r, "success");
+    assert.ok("evidence_status" in r);
+    assert.equal(r.evidence_status, "failed");
+    assert.equal(r.evidence_persisted, false);
+    assert.equal(r.evidence_error?.code, "evidence_write_failed");
+    assert.ok(r.warnings.includes("evidence_not_persisted"));
+  });
+
+  it("does not store an unread body as if it were the response", async () => {
+    route("/ev-unread", (_req, res) => {
+      res.writeHead(404, { "content-type": "application/pdf" });
+      res.end("%PDF-1.7 not read");
+    });
+    const store = new FileEvidenceStore(join(evidenceRoot, "b"));
+    const r = await fetchPublicPage(url("/ev-unread"), policy(), deps({ evidence: store }));
+    assert.ok("evidence_status" in r);
+    assert.equal(r.evidence_status, "failed");
+    assert.equal(r.evidence_persisted, false);
+    assert.equal(r.evidence_error?.code, "evidence_body_not_read");
+  });
+
+  it("persists nothing for a denied request", async () => {
+    const calls: unknown[] = [];
+    const spy: EvidenceSink = { persist: async (...args) => (calls.push(args), { evidence_status: "disabled", evidence_persisted: false }) };
+    const r = await fetchPublicPage(url("/x", "private.test"), policy(), deps({ evidence: spy }));
+    expectStatus(r, "policy_denied");
+    assert.equal(calls.length, 0);
   });
 });
 

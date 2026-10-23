@@ -611,7 +611,14 @@ export function classifyChallenge(obs: ChallengeObservation): ChallengeResult {
 // Hashing
 // ---------------------------------------------------------------------------
 
-export type HashBasis = "decoded_body_bytes" | "extracted_text_utf8";
+/**
+ * What a content hash covers. Persisted evidence always stores exactly these bytes:
+ *   decoded_body_bytes:   response body after Content-Encoding is removed
+ *   extracted_text_utf8:  extracted text, UTF-8 encoded
+ *   rendered_dom_utf8:    the browser's serialised DOM at capture time, UTF-8 encoded
+ *   screenshot_png_bytes: the PNG file as returned by the browser
+ */
+export type HashBasis = "decoded_body_bytes" | "extracted_text_utf8" | "rendered_dom_utf8" | "screenshot_png_bytes";
 
 export interface ContentHash {
   algorithm: "sha256";

@@ -21,6 +21,7 @@ import {
   type UrlDisclosure,
   type UrlPolicy,
 } from "./security.js";
+import { NO_EVIDENCE, type EvidenceOutcome, type EvidenceSink } from "./evidence.js";
 import { newRequestId, stderrAuditLogger, TOOL_VERSION, toolError, type AuditLogger, type Status, type ToolError } from "./result.js";
 
 export interface FetchPolicy extends UrlPolicy {
@@ -58,6 +59,8 @@ export interface FetchDeps {
   now: () => Date;
   /** Extra trust anchors (tests only). Never disables certificate verification. */
   tlsCa?: string | Buffer;
+  /** Where retrieved bodies are persisted. Defaults to NO_EVIDENCE (disabled). */
+  evidence?: EvidenceSink;
 }
 
 export const defaultResolve = async (hostname: string): Promise<ResolvedAddress[]> => {
@@ -98,7 +101,11 @@ export interface FetchSuccess extends Base {
   content_hash: ContentHash;
   challenge: ChallengeResult;
   challenge_type: ChallengeResult["challenge_type"];
-  evidence_persisted: false;
+  /** True only when the decoded body bytes were written and read back with the declared hash. */
+  evidence_persisted: boolean;
+  evidence_status: "disabled" | "persisted" | "failed";
+  evidence_id?: string;
+  evidence_error?: ToolError;
   error?: ToolError;
 }
 
@@ -482,22 +489,39 @@ export async function fetchPublicPage(
 
       const challenge = classifyChallenge({ httpStatus, headers, ...(title ? { title } : {}), body: decoded.slice(0, 20_000) });
       const status = statusFor(httpStatus, challenge);
+      const retrievedAt = deps.now().toISOString();
+      // Hash basis is declared; it covers the full decoded body even if text was truncated.
+      const contentHash = sha256(body, "decoded_body_bytes");
+      // The stored object is exactly the hashed bytes; the store re-checks the declared hash.
+      // A body that was not read (disallowed type on an error status) is never stored as if it were the response.
+      const sink = deps.evidence ?? NO_EVIDENCE;
+      const evidence: EvidenceOutcome =
+        isText || sink === NO_EVIDENCE
+          ? await sink.persist(
+              body,
+              { kind: "http_response_body", media_type: mime || "application/octet-stream", basis: "decoded_body_bytes", source_url: key, request_id: requestId, captured_at: retrievedAt, http_status: httpStatus },
+              contentHash,
+            )
+          : { evidence_status: "failed", evidence_persisted: false, evidence_error: toolError("evidence_unavailable", "evidence_body_not_read", "The response body was not read, so there is nothing to persist") };
+      if (evidence.evidence_status === "failed") warnings.push("evidence_not_persisted");
       const result: FetchSuccess = {
         ...base(),
         status: status as FetchSuccess["status"],
         final_url: discloseUrl(key, disclosure),
         title,
-        retrieved_at: deps.now().toISOString(),
+        retrieved_at: retrievedAt,
         content_type: mime,
         http_status: httpStatus,
         // Untrusted page content: data only, never instructions.
         extracted_text: truncated ? text.slice(0, policy.maxTextChars) : text,
         text_truncated: truncated,
-        // Hash basis is declared; it covers the full decoded body even if text was truncated.
-        content_hash: sha256(body, "decoded_body_bytes"),
+        content_hash: contentHash,
         challenge,
         challenge_type: challenge.challenge_type,
-        evidence_persisted: false,
+        evidence_persisted: evidence.evidence_persisted,
+        evidence_status: evidence.evidence_status,
+        ...(evidence.evidence_status === "persisted" ? { evidence_id: evidence.evidence_id } : {}),
+        ...(evidence.evidence_status === "failed" ? { evidence_error: evidence.evidence_error } : {}),
       };
       if (status !== "success") {
         result.error = toolError(status, challenge.challenge_type === "none" ? `http_${httpStatus}` : challenge.challenge_type, challenge.recommended_action);
