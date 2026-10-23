@@ -62,6 +62,8 @@ export interface BrowserResult {
   handoff?: Handoff;
   evidence?: EvidenceRef[];
   blocked_requests?: { origin: string; code: string }[];
+  failed_requests?: { origin: string; resource_type: string; status?: number; error_text?: string }[];
+  net_error?: string;
   [key: string]: unknown;
 }
 
@@ -73,6 +75,7 @@ export interface ScreenshotResult {
 interface Marks {
   proxy: number;
   context: number;
+  failed: number;
 }
 
 class ActionStop extends Error {
@@ -135,6 +138,8 @@ export class BrowserAgent {
       session_id: session.id,
       session_state: session.state,
       warnings,
+      blocked_requests: [],
+      failed_requests: [],
       headless: this.config.headless,
       limits: {
         max_sessions: this.config.maxSessions,
@@ -152,8 +157,10 @@ export class BrowserAgent {
     const session = this.sessions.get(id);
     if (!session) return this.fail(request_id, id, "invalid_input", "unknown_session", "No open browser session has this id");
     this.sessions.delete(id);
+    const result: BrowserResult = { status: "success", request_id, session_id: id, session_state: "CLOSED", warnings: [], blocked_requests: [], failed_requests: [] };
+    this.attachDiagnostics(session, result);
     await session.close("closed_by_caller");
-    return { status: "success", request_id, session_id: id, session_state: "CLOSED", warnings: [] };
+    return result;
   }
 
   async closeAll(reason = "shutdown"): Promise<void> {
@@ -197,6 +204,15 @@ export class BrowserAgent {
         response = await s.page.goto(check.url.toString(), { waitUntil: "domcontentloaded" });
       } catch (err) {
         throw this.navigationError(s, marks, err);
+      }
+      const responseOrigin = response ? redactUrl(response.url(), "origin") : null;
+      const proxyError = response && response.status() >= 500 && responseOrigin
+        ? s.proxy.events().filter((event) => event.kind === "error" && event.seq > marks.proxy && event.origin === responseOrigin).at(-1)
+        : undefined;
+      if (proxyError) {
+        const failedRequest = s.failedRequests.filter((item) => item.seq > marks.failed && item.origin === responseOrigin && item.error_text?.startsWith("net::ERR_")).at(-1);
+        const status: Status = proxyError.code === "connect_timeout" ? "timeout" : "provider_unavailable";
+        throw new ActionStop(status, proxyError.code, "Navigation failed while connecting to the destination", failedRequest?.error_text ? { net_error: failedRequest.error_text } : {});
       }
       const denied = response?.headers()[DENIAL_HEADER];
       if (denied) throw new ActionStop("policy_denied", denied, "A request in the redirect chain was refused by policy");
@@ -405,11 +421,13 @@ export class BrowserAgent {
     const result = await session.run(async (): Promise<BrowserResult> => {
       if (session.state === "CLOSED") return this.fail(request_id, id, "invalid_input", "unknown_session", "The session was closed");
       if (session.state === "BLOCKED" && !opts.allowBlocked) {
-        return {
+        const paused: BrowserResult = {
           ...this.fail(request_id, id, "human_verification_required", "session_paused", "The session is paused for a person; only browser.resume_session or browser.close_session are accepted"),
           session_state: "BLOCKED",
           ...(session.pause ? { handoff_pause_id: session.pause.pause_id } : {}),
         };
+        this.attachDiagnostics(session, paused);
+        return paused;
       }
       session.lastUsedAt = Date.now();
       session.warnings.clear();
@@ -424,10 +442,13 @@ export class BrowserAgent {
       try {
         const out = await Promise.race([fn(session, r), deadline]);
         if (out === "deadline") {
+          const timedOut = { ...this.fail(request_id, id, "timeout", "action_deadline_exceeded", "The action did not finish in time; the session was closed"), session_state: "CLOSED" as const };
+          this.attachDiagnostics(session, timedOut);
           this.sessions.delete(id);
           await session.close("action_deadline_exceeded");
-          return { ...this.fail(request_id, id, "timeout", "action_deadline_exceeded", "The action did not finish in time; the session was closed"), session_state: "CLOSED" };
+          return timedOut;
         }
+        this.attachDiagnostics(session, out);
         out.session_state = session.state;
         if (!session.isClosed) {
           out.url ??= this.show(session.page.url());
@@ -437,7 +458,9 @@ export class BrowserAgent {
         return out;
       } catch (err) {
         const stop = this.toStop(err);
-        return { ...r, status: stop.status, error: toolError(stop.status, stop.code, stop.message), session_state: session.state, ...stop.extra, ...(!session.isClosed ? { url: this.show(session.page.url()) } : {}) };
+        const failed = { ...r, status: stop.status, error: toolError(stop.status, stop.code, stop.message), session_state: session.state, ...stop.extra, ...(!session.isClosed ? { url: this.show(session.page.url()) } : {}) };
+        this.attachDiagnostics(session, failed);
+        return failed;
       } finally {
         clearTimeout(timer);
       }
@@ -467,7 +490,7 @@ export class BrowserAgent {
   }
 
   private fail(request_id: string, session_id: string | null, status: Status, code: string, message: string): BrowserResult {
-    return { status, request_id, session_id, session_state: session_id ? (this.sessions.get(session_id)?.state ?? null) : null, warnings: [], error: toolError(status, code, message) };
+    return { status, request_id, session_id, session_state: session_id ? (this.sessions.get(session_id)?.state ?? null) : null, warnings: [], error: toolError(status, code, message), blocked_requests: [], failed_requests: [] };
   }
 
   private show(raw: string): string {
@@ -497,11 +520,31 @@ export class BrowserAgent {
 
   /** Sequence numbers of the newest denials so far, in the browser and in the proxy. */
   private marks(s: BrowserSession): Marks {
-    return { proxy: s.proxy.denials().at(-1)?.seq ?? 0, context: s.blockedRequests.at(-1)?.seq ?? 0 };
+    return { proxy: s.proxy.events().at(-1)?.seq ?? 0, context: s.blockedRequests.at(-1)?.seq ?? 0, failed: s.failedRequests.at(-1)?.seq ?? 0 };
   }
 
   private newDenials(s: BrowserSession, marks: Marks): { origin: string; code: string }[] {
-    return [...s.blockedRequests.filter((d) => d.seq > marks.context), ...s.proxy.denials().filter((d) => d.seq > marks.proxy)].map((d) => ({ origin: d.origin, code: d.code }));
+    return [
+      ...s.blockedRequests.filter((d) => d.seq > marks.context),
+      ...s.proxy.events().filter((d) => d.kind === "deny" && d.seq > marks.proxy),
+    ].map((d) => ({ origin: d.origin, code: d.code }));
+  }
+
+  /** Attach bounded, origin-only diagnostics since the previous browser result. */
+  private attachDiagnostics(s: BrowserSession, r: BrowserResult): void {
+    const contextBlocked = s.blockedRequests.filter((d) => d.seq > s.lastReportedBlockedContextSeq);
+    const proxyBlocked = s.proxy.events().filter((d) => d.kind === "deny" && d.seq > s.lastReportedBlockedProxySeq);
+    const blocked = [
+      ...contextBlocked.map(({ origin, code }) => ({ origin, code })),
+      ...proxyBlocked.map(({ origin, code }) => ({ origin, code })),
+    ];
+    r.blocked_requests = blocked.slice(-20);
+    s.lastReportedBlockedContextSeq = Math.max(s.lastReportedBlockedContextSeq, ...contextBlocked.map((d) => d.seq), 0);
+    s.lastReportedBlockedProxySeq = Math.max(s.lastReportedBlockedProxySeq, ...proxyBlocked.map((d) => d.seq), 0);
+    const failed = s.failedRequests.filter((d) => d.seq > s.lastReportedFailedSeq);
+    r.failed_requests = failed.slice(-20).map(({ origin, resource_type, status, error_text }) => ({ origin, resource_type, ...(status === undefined ? {} : { status }), ...(error_text ? { error_text } : {}) }));
+    s.lastReportedFailedSeq = Math.max(s.lastReportedFailedSeq, ...failed.map((d) => d.seq), 0);
+    if (blocked.length && !r.warnings.includes("requests_blocked_by_policy")) r.warnings.push("requests_blocked_by_policy");
   }
 
   private blockedSince(s: BrowserSession, marks: Marks, r: BrowserResult): void {
@@ -513,16 +556,22 @@ export class BrowserAgent {
   }
 
   private navigationError(s: BrowserSession, marks: Marks, err: unknown): ActionStop {
-    if (err instanceof playwrightErrors.TimeoutError) return new ActionStop("timeout", "navigation_timeout", "Navigation timed out");
+    const message = err instanceof Error ? err.message : "";
+    const netError = message.match(/net::ERR_[A-Z0-9_]+/)?.[0];
+    const proxyError = s.proxy.events().filter((d) => d.kind === "error" && d.seq > marks.proxy).at(-1);
+    if (proxyError) {
+      const status: Status = proxyError.code === "connect_timeout" ? "timeout" : "provider_unavailable";
+      return new ActionStop(status, proxyError.code, "Navigation failed while connecting to the destination", netError ? { net_error: netError } : {});
+    }
     const denied = this.newDenials(s, marks);
     if (denied.length) {
       const last = denied[denied.length - 1]!;
-      return new ActionStop("policy_denied", last.code, "Navigation was refused by policy", { blocked_requests: denied.slice(-20) });
+      return new ActionStop("policy_denied", last.code, "Navigation was refused by policy", { blocked_requests: denied.slice(-20), ...(netError ? { net_error: netError } : {}) });
     }
-    const message = err instanceof Error ? err.message : "";
-    if (/ERR_CERT|ERR_SSL|SSL_PROTOCOL/i.test(message)) return new ActionStop("policy_denied", "tls_verification_failed", "TLS certificate verification failed");
-    if (/ERR_ABORTED/.test(message)) return new ActionStop("blocked", "navigation_aborted", "Navigation was aborted (for example a download, which is refused)");
-    if (/net::ERR_/.test(message)) return new ActionStop("provider_unavailable", "navigation_failed", "Navigation failed");
+    if (err instanceof playwrightErrors.TimeoutError) return new ActionStop("timeout", "navigation_timeout", "Navigation timed out");
+    if (/ERR_CERT|ERR_SSL|SSL_PROTOCOL/i.test(message)) return new ActionStop("policy_denied", "tls_verification_failed", "TLS certificate verification failed", netError ? { net_error: netError } : {});
+    if (/ERR_ABORTED/.test(message)) return new ActionStop("blocked", "navigation_aborted", "Navigation was aborted (for example a download, which is refused)", netError ? { net_error: netError } : {});
+    if (netError) return new ActionStop("provider_unavailable", "navigation_failed", "Navigation failed", { net_error: netError });
     return this.toStop(err);
   }
 

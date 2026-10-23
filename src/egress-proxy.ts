@@ -56,13 +56,18 @@ export interface EgressDeps {
   log: AuditLogger;
 }
 
-export interface EgressDenial {
-  /** Increases by one per denial over the proxy's lifetime. */
+export interface EgressDiagnostic {
+  /** Increases by one per diagnostic event over the proxy's lifetime. */
   seq: number;
-  /** Origin only. */
+  /** Origin only; never a path or query. */
   origin: string;
   code: string;
+  kind: "error" | "deny";
   at: string;
+}
+
+export interface EgressDenial extends EgressDiagnostic {
+  kind: "deny";
 }
 
 export interface EgressProxy {
@@ -70,8 +75,10 @@ export interface EgressProxy {
   readonly port: number;
   readonly username: string;
   readonly password: string;
-  /** The most recent denials (at most 50), newest last. */
+  /** The most recent policy denials (at most 50), newest last. */
   denials(): readonly EgressDenial[];
+  /** The most recent origin-only denials and connection errors (at most 50). */
+  events(): readonly EgressDiagnostic[];
   bytesRelayed(): number;
   close(): Promise<void>;
 }
@@ -102,7 +109,7 @@ export async function startEgressProxy(policy: EgressPolicy, deps: EgressDeps): 
   const username = "rbmcp";
   const password = randomBytes(24).toString("base64url");
   const expected = Buffer.from(`Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`);
-  const recent: EgressDenial[] = [];
+  const recent: EgressDiagnostic[] = [];
   const open = new Set<Duplex>();
   let relayed = 0;
   let seq = 0;
@@ -119,11 +126,12 @@ export async function startEgressProxy(policy: EgressPolicy, deps: EgressDeps): 
     s.once("close", () => open.delete(s));
   };
 
-  const deny = (origin: string, code: string) => {
-    recent.push({ seq: ++seq, origin, code, at: new Date().toISOString() });
+  const record = (origin: string, code: string, kind: "error" | "deny") => {
+    recent.push({ seq: ++seq, origin, code, kind, at: new Date().toISOString() });
     if (recent.length > 50) recent.shift();
-    deps.log({ event: "egress", decision: "deny", origin, code });
+    deps.log({ event: "egress", decision: kind, kind, origin, code });
   };
+  const deny = (origin: string, code: string) => record(origin, code, "deny");
 
   /** Counts relayed bytes; once the session budget is spent every open connection is closed. */
   const count = (n: number) => {
@@ -134,21 +142,21 @@ export async function startEgressProxy(policy: EgressPolicy, deps: EgressDeps): 
   };
 
   /** Shared checks for both request kinds. Returns the connected upstream socket or a denial. */
-  const admit = async (target: string, method: string | null): Promise<{ socket: Socket; origin: string } | { status: number; code: string; origin: string }> => {
+  const admit = async (target: string, method: string | null): Promise<{ socket: Socket; origin: string } | { status: number; code: string; origin: string; kind: "error" | "deny" }> => {
     const origin = redactUrl(target, "origin");
-    if (closed) return { status: 503, code: "proxy_closed", origin };
+    if (closed) return { status: 503, code: "proxy_closed", origin, kind: "error" };
     const check = validateUrl(target, policy);
     if (!check.ok) {
       deny(origin, check.code);
-      return { status: check.status === "invalid_input" ? 400 : 403, code: check.code, origin };
+      return { status: check.status === "invalid_input" ? 400 : 403, code: check.code, origin, kind: "deny" };
     }
     if (method !== null && !policy.allowedMethods.has(method) && !isUrlHostListed(check.url, policy.formSubmitHosts)) {
       deny(origin, "method_not_allowed");
-      return { status: 403, code: "method_not_allowed", origin };
+      return { status: 403, code: "method_not_allowed", origin, kind: "deny" };
     }
     if (relayed >= policy.maxSessionBytes) {
       deny(origin, "session_byte_budget_exceeded");
-      return { status: 403, code: "session_byte_budget_exceeded", origin };
+      return { status: 403, code: "session_byte_budget_exceeded", origin, kind: "deny" };
     }
     try {
       const { socket, peer } = await connectPinned(check.hostname, check.ipLiteral, check.port, policy, deps, policy.connectTimeoutMs);
@@ -157,8 +165,8 @@ export async function startEgressProxy(policy: EgressPolicy, deps: EgressDeps): 
     } catch (err) {
       const stop = err instanceof FetchStop ? err : new FetchStop("provider_unavailable", "connection_failed", "Connection failed");
       if (stop.status === "policy_denied") deny(origin, stop.code);
-      else deps.log({ event: "egress", decision: "error", origin, code: stop.code });
-      return { status: stop.status === "policy_denied" ? 403 : stop.status === "timeout" ? 504 : 502, code: stop.code, origin };
+      else record(origin, stop.code, "error");
+      return { status: stop.status === "policy_denied" ? 403 : stop.status === "timeout" ? 504 : 502, code: stop.code, origin, kind: stop.status === "policy_denied" ? "deny" : "error" };
     }
   };
 
@@ -187,7 +195,7 @@ export async function startEgressProxy(policy: EgressPolicy, deps: EgressDeps): 
       const method = (req.method ?? "GET").toUpperCase();
       const admitted = await admit(target, method);
       if ("status" in admitted) {
-        res.writeHead(admitted.status, { [DENIAL_HEADER]: admitted.code, "content-type": "text/plain", connection: "close" });
+        res.writeHead(admitted.status, { ...(admitted.kind === "deny" ? { [DENIAL_HEADER]: admitted.code } : {}), "content-type": "text/plain", connection: "close" });
         res.end(`Blocked by research-browser policy: ${admitted.code}\n`);
         req.resume();
         return;
@@ -250,7 +258,7 @@ export async function startEgressProxy(policy: EgressPolicy, deps: EgressDeps): 
       // A tunnel carries TLS, so it is judged as the https URL it will fetch.
       const admitted = await admit(`https://${m[1]}:${m[2]}/`, null);
       if ("status" in admitted) {
-        rawReply(client, admitted.status, admitted.status === 403 ? "Forbidden" : "Bad Gateway", { [DENIAL_HEADER]: admitted.code });
+        rawReply(client, admitted.status, admitted.status === 403 ? "Forbidden" : "Bad Gateway", admitted.kind === "deny" ? { [DENIAL_HEADER]: admitted.code } : {});
         return;
       }
       const upstream = admitted.socket;
@@ -300,7 +308,8 @@ export async function startEgressProxy(policy: EgressPolicy, deps: EgressDeps): 
     port,
     username,
     password,
-    denials: () => [...recent],
+    denials: () => recent.filter((event): event is EgressDenial => event.kind === "deny"),
+    events: () => [...recent],
     bytesRelayed: () => relayed,
     close: () =>
       new Promise<void>((resolve) => {

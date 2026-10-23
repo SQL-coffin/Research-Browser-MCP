@@ -207,6 +207,7 @@ The exact schema is to be finalized alongside acceptance tests. The initial cand
 - `research.pause_for_human` — persist a blocked task and provide a human handoff.
 - `research.resume` — continue only after a trusted human-feedback event is recorded by the integrating runtime.
 - `browser.open_session`, `browser.navigate`, `browser.snapshot`, `browser.click`, `browser.type`, `browser.scroll`, `browser.screenshot`, `browser.pause_for_human`, `browser.resume_session`, `browser.close_session` — the optional browser agent; see [Browser agent](docs/07-browser-agent.md).
+  Browser results include bounded `blocked_requests` and `failed_requests` diagnostics (up to 20 new entries per result), with origin-only URLs and sanitized Chromium network error codes. Proxy DNS/connection failures are logged as origin-only diagnostic events; no request paths, query strings, headers, cookies, bodies, or typed text are logged.
 
 The server must not treat MCP itself as a security boundary. The client/runtime is responsible for registering tools only in allowed modes, controlling data scopes and egress, and enforcing its Policy Gate. The server must still independently validate requests and protect its network boundary.
 

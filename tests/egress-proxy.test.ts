@@ -421,3 +421,17 @@ function hasOpenssl(): boolean {
     return false;
   }
 }
+
+describe("egress proxy diagnostics", () => {
+  it("records resolver failures as origin-only error events", async () => {
+    const proxy = await start(policy({ allowedHosts: parseHostAllowlist("dnsfail.test") }));
+    const r = await viaProxy(proxy, `http://dnsfail.test:${port}/private/path?token=secret`);
+    assert.equal(r.status, 502);
+    const event = proxy.events().at(-1);
+    assert.equal(event?.kind, "error");
+    assert.equal(event?.code, "dns_resolution_failed");
+    assert.equal(event?.origin, `http://dnsfail.test:${port}`);
+    assert.doesNotMatch(JSON.stringify(event), /private|token|secret/);
+    assert.doesNotMatch(JSON.stringify(logs), /private|token|secret/);
+  });
+});

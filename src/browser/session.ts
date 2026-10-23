@@ -112,7 +112,13 @@ export class BrowserSession {
   pause: SessionPause | null = null;
   /** Requests the context refused before they reached the proxy, newest last (origins only). */
   readonly blockedRequests: { seq: number; origin: string; code: string }[] = [];
+  /** Failed requests, with URLs reduced to origin and errors reduced to network error codes. */
+  readonly failedRequests: { seq: number; origin: string; resource_type: string; status?: number; error_text?: string }[] = [];
+  lastReportedBlockedContextSeq = 0;
+  lastReportedBlockedProxySeq = 0;
+  lastReportedFailedSeq = 0;
   private blockedSeq = 0;
+  private failedSeq = 0;
   readonly warnings = new Set<string>();
   private queue: Promise<unknown> = Promise.resolve();
   private closing: Promise<void> | null = null;
@@ -204,9 +210,18 @@ export class BrowserSession {
       this.warnings.add("download_refused");
       void d.cancel().catch(() => {});
     });
+    page.on("requestfailed", (request) => {
+      const rawError = request.failure()?.errorText ?? "request_failed";
+      // Playwright error text can include a URL on some versions; retain only a Chromium error token.
+      const errorText = rawError.match(/net::ERR_[A-Z0-9_]+/)?.[0] ?? "request_failed";
+      this.recordFailed(redactUrl(request.url(), "origin"), request.resourceType(), undefined, errorText);
+    });
     page.on("response", (res) => {
-      if (res.request().isNavigationRequest() && res.frame() === page.mainFrame()) {
+      const request = res.request();
+      if (request.isNavigationRequest() && res.frame() === page.mainFrame()) {
         this.mainResponse = { status: res.status(), retryAfter: res.headers()["retry-after"] ?? null };
+      } else if (res.status() >= 400) {
+        this.recordFailed(redactUrl(request.url(), "origin"), request.resourceType(), res.status());
       }
     });
     this.browser.on("disconnected", () => {
@@ -226,6 +241,12 @@ export class BrowserSession {
     this.blockedRequests.push({ seq: ++this.blockedSeq, origin, code });
     if (this.blockedRequests.length > 50) this.blockedRequests.shift();
     this.deps.log({ event: "browser_request_blocked", session_id: this.id, origin, code });
+  }
+
+  recordFailed(origin: string, resourceType: string, status?: number, errorText?: string): void {
+    this.failedRequests.push({ seq: ++this.failedSeq, origin, resource_type: resourceType, ...(status === undefined ? {} : { status }), ...(errorText ? { error_text: errorText } : {}) });
+    if (this.failedRequests.length > 50) this.failedRequests.shift();
+    this.deps.log({ event: "browser_request_failed", session_id: this.id, origin, resource_type: resourceType, ...(status === undefined ? {} : { status }), ...(errorText ? { error_text: errorText } : {}) });
   }
 
   /** Runs `fn` after every earlier action on this session has finished. */

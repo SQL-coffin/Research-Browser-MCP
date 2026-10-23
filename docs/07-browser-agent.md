@@ -50,12 +50,12 @@ All take a `session_id` (UUID) except `open_session`. None takes a host, header,
 | Tool | Input | Notes |
 |---|---|---|
 | `browser.open_session` | — | Returns `session_id`, `headless`, limits. |
-| `browser.navigate` | `url` | Checked before the browser is involved, then on every hop. Returns `http_status`, `title`, `redirect_chain`, `content_hash` (`decoded_body_bytes`), `blocked_requests`, `challenge`. |
-| `browser.snapshot` | — | `title`, visible `text` (≤ 20,000 chars), `elements[]` (≤ 200) with `index`, `tag`, `role`, `type`, `name`, `href`, `disabled`, `in_viewport`, `editable`, `submits_form`; `untrusted_content: true`; `content_hash` (`rendered_dom_utf8`). |
+| `browser.navigate` | `url` | Checked before the browser is involved, then on every hop. Returns `http_status`, `title`, `redirect_chain`, `content_hash` (`decoded_body_bytes`), `blocked_requests`, `failed_requests`, `challenge`; navigation errors may include an origin-free `net_error` token such as `net::ERR_NAME_NOT_RESOLVED`. |
+| `browser.snapshot` | — | `title`, visible `text` (≤ 20,000 chars), `elements[]` (≤ 200) with `index`, `tag`, `role`, `type`, `name`, `href`, `disabled`, `in_viewport`, `editable`, `submits_form`; `untrusted_content: true`; `content_hash` (`rendered_dom_utf8`); `blocked_requests` and `failed_requests`. |
 | `browser.click` | `index` | Index from the latest snapshot. Refuses form submission (unless the host is opted in) and file inputs. Reports `navigated`. |
 | `browser.type` | `index`, `text` (≤ 2,000) | Replaces the field's text without pressing Enter. Refuses password fields, `autocomplete` credential, one-time-code and payment (`cc-*`) fields, and non-text inputs. The text is never echoed or logged. |
 | `browser.scroll` | `direction`, `pixels` or `index` | Returns the scroll position. |
-| `browser.screenshot` | `full_page` | PNG as MCP image content, password fields masked, ≤ 5 MiB; `content_hash` (`screenshot_png_bytes`). |
+| `browser.screenshot` | `full_page` | PNG as MCP image content, password fields masked, ≤ 5 MiB; `content_hash` (`screenshot_png_bytes`); `blocked_requests` and `failed_requests`. |
 | `browser.pause_for_human` | — | Pauses the session as for a detected challenge. |
 | `browser.resume_session` | `host_event_ref` | Resumes only on an accepted trusted host event (see §6). |
 | `browser.close_session` | — | Releases everything. |
@@ -68,7 +68,9 @@ Text, element names, titles and screenshots are data from the web. Results carry
 
 ### URL privacy
 
-Every URL in a browser result (`url`, `redirect_chain`, link `href`s, `blocked_requests`) follows the same rule as fetch results: the origin only, unless the host is listed in `RESEARCH_BROWSER_FULL_URL_HOSTS`. Logs, handoff records and evidence records are always origin-only.
+Every browser tool result includes `blocked_requests` and `failed_requests` arrays (up to 20 new entries each, since the prior result). A blocked entry contains only `origin` and policy `code`. A failed-request entry contains only `origin`, `resource_type`, and either an HTTP `status` (≥ 400, for subresources) or a sanitized `error_text` token; Chromium errors are reduced to `net::ERR_*` names, never raw error strings. Proxy DNS/connection errors are retained as origin-only diagnostic events, so navigation errors can report the underlying proxy code instead of only `navigation_failed`. Audit logs use the same origin-only fields and never include paths, query strings, headers, cookies, request bodies, or typed text.
+
+Every URL in a browser result (`url`, `redirect_chain`, link `href`s) follows the same disclosure rule as fetch results: the origin only, unless the host is listed in `RESEARCH_BROWSER_FULL_URL_HOSTS`. `blocked_requests`, `failed_requests`, audit logs, handoff records and evidence records are always origin-only.
 
 ## 5. Challenge detection and pause
 

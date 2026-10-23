@@ -161,9 +161,13 @@ describe("browser sessions", { skip: SKIP }, () => {
     const r = await agent.openSession();
     expect(r, "success");
     assert.equal(r.session_state, "ACTIVE");
+    assert.ok(Array.isArray(r.blocked_requests));
+    assert.ok(Array.isArray(r.failed_requests));
     assert.equal(agent.sessionCount, 1);
     const closed = await agent.closeSession(r.session_id!);
     expect(closed, "success");
+    assert.ok(Array.isArray(closed.blocked_requests));
+    assert.ok(Array.isArray(closed.failed_requests));
     assert.equal(closed.session_state, "CLOSED");
     assert.equal(agent.sessionCount, 0);
     const again = await agent.navigate(r.session_id!, url("/"));
@@ -682,6 +686,7 @@ describe("browser over HTTPS (CONNECT tunnel)", { skip: SKIP || (!process.env.CI
     const id = await open(agent);
     const r = await agent.navigate(id, `https://fixture.test:${tlsPort}/`);
     expect(r, "policy_denied", "tls_verification_failed");
+    assert.match(String(r.net_error), /^net::ERR_[A-Z0-9_]+$/);
   });
 
   it("refuses a tunnel to a private address", async () => {
@@ -701,3 +706,30 @@ function hasOpenssl(): boolean {
     return false;
   }
 }
+
+describe("browser request diagnostics", { skip: SKIP }, () => {
+  it("returns origin-only blocked and failed subresource requests", async () => {
+    const agent = makeAgent();
+    const id = await open(agent);
+    routes.set("/diagnostics", page(`<title>Fixture</title><script src="/missing.js"></script><img src="http://other.test:${port}/pixel?token=secret">`));
+    const r = await agent.navigate(id, url("/diagnostics"));
+    expect(r, "success");
+    assert.ok(Array.isArray(r.blocked_requests), JSON.stringify(r));
+    assert.ok(Array.isArray(r.failed_requests), JSON.stringify(r));
+    assert.ok((r.blocked_requests as { origin: string; code: string }[]).some((x) => x.origin === `http://other.test:${port}`));
+    assert.ok((r.failed_requests as { origin: string; status?: number }[]).some((x) => x.origin === `http://fixture.test:${port}` && x.status === 404));
+    const serialized = JSON.stringify(r);
+    assert.doesNotMatch(serialized, /diagnostics|missing\.js|pixel|token|secret/i);
+    assert.doesNotMatch(JSON.stringify(logs), /diagnostics|missing\.js|pixel|token|secret/i);
+  });
+
+  it("reports the proxy DNS error and a sanitized Chromium net_error", async () => {
+    const agent = makeAgent({}, {}, { allowedHosts: parseHostAllowlist("fixture.test dnsfail.test") });
+    const id = await open(agent);
+    const r = await agent.navigate(id, url("/sensitive/path?secret=value", "dnsfail.test"));
+    expect(r, "provider_unavailable", "dns_resolution_failed");
+    if (r.net_error !== undefined) assert.match(String(r.net_error), /^net::ERR_[A-Z0-9_]+$/);
+    assert.doesNotMatch(JSON.stringify(r), /sensitive|secret|value/);
+    assert.doesNotMatch(JSON.stringify(logs), /sensitive|secret|value/);
+  });
+});
