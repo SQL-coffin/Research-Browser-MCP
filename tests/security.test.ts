@@ -217,6 +217,21 @@ describe("host allowlist (startup configuration)", () => {
     });
   }
 
+  // Some Node builds' URL parsers accept malformed A-labels, so these must be
+  // rejected by our own Punycode check, independent of the parser.
+  for (const label of ["xn--zz", "xn--a", "xn--", "xn--99999999999999999999z", "xn--a-zz"]) {
+    it(`rejects the malformed Punycode label ${label} in entries and request URLs`, () => {
+      assert.throws(() => parseHostAllowlist(`${label}.example`), HostAllowlistError);
+      const r = validateUrl(`https://${label}.example/`, { ...DEFAULT_URL_POLICY, allowedHosts: parseHostAllowlist("example.org") });
+      assert.ok(!r.ok && (r.code === "invalid_host" || r.code === "url_unparseable"), JSON.stringify(r));
+    });
+  }
+
+  it("accepts well-formed Punycode labels", () => {
+    const hosts = parseHostAllowlist("xn--bcher-kva.example xn--ls8h.example xn--exmple-4nf.org");
+    assert.deepEqual([...hosts.exact].sort(), ["xn--bcher-kva.example", "xn--exmple-4nf.org", "xn--ls8h.example"]);
+  });
+
   it("does not echo a rejected entry, which might carry credentials", () => {
     assert.throws(
       () => parseHostAllowlist("https://alice:s3cr3t-PW@example.org/"),
