@@ -111,7 +111,7 @@ Known gaps:
 - For hosts opted in to full URLs, results show paths and the values of innocuously named query parameters. Origin-only output is the default precisely because no program can find every secret there.
 - Event times are compared with zero clock-skew tolerance, so the host's and this service's clocks must agree.
 - The DNS-rebinding tests use an injected resolver and loopback fixtures. They have not been run in a controlled network sandbox with a real authoritative DNS server.
-- No durable evidence sink: results report `evidence_persisted: false`. Handoff records and the classification cache are in memory only (see above).
+- Evidence persistence is off unless `RESEARCH_BROWSER_EVIDENCE_DIR` names an existing absolute directory; without it results report `evidence_persisted: false`. See the [evidence persistence contract](docs/07-evidence-persistence.md). Handoff records and the classification cache are in memory only (see above).
 - No search provider is enabled by default, and none ships with this repository; `research.search` answers `provider_unavailable`. Robots.txt is not consulted yet.
 - Text extraction is regex-based and is not a full HTML parser.
 
@@ -202,6 +202,7 @@ The server must not treat MCP itself as a security boundary. The client/runtime 
 - [Evidence and provenance](docs/04-evidence-and-provenance.md)
 - [Human verification and resume protocol](docs/05-human-verification-resume.md)
 - [Acceptance tests](docs/06-acceptance-tests.md)
+- [Evidence persistence contract](docs/07-evidence-persistence.md)
 
 ## License
 

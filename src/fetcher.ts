@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { lookup as dnsLookup } from "node:dns/promises";
 import http from "node:http";
 import https from "node:https";
@@ -21,6 +22,7 @@ import {
   type UrlDisclosure,
   type UrlPolicy,
 } from "./security.js";
+import { EVIDENCE_SCHEMA_VERSION, type EvidenceFailureCode, type EvidenceRecord, type EvidenceStore } from "./evidence.js";
 import { newRequestId, stderrAuditLogger, TOOL_VERSION, toolError, type AuditLogger, type Status, type ToolError } from "./result.js";
 
 export interface FetchPolicy extends UrlPolicy {
@@ -58,6 +60,11 @@ export interface FetchDeps {
   now: () => Date;
   /** Extra trust anchors (tests only). Never disables certificate verification. */
   tlsCa?: string | Buffer;
+  /**
+   * Durable evidence sink from startup configuration. Absent: persistence is off
+   * and nothing is written. See docs/07-evidence-persistence.md.
+   */
+  evidence?: EvidenceStore;
 }
 
 export const defaultResolve = async (hostname: string): Promise<ResolvedAddress[]> => {
@@ -98,7 +105,12 @@ export interface FetchSuccess extends Base {
   content_hash: ContentHash;
   challenge: ChallengeResult;
   challenge_type: ChallengeResult["challenge_type"];
-  evidence_persisted: false;
+  /** True only after the configured store confirmed the save. */
+  evidence_persisted: boolean;
+  /** Present only when evidence_persisted is true. */
+  evidence_id?: string;
+  /** Present only when evidence_persisted is true; relative to the sink root. */
+  payload_ref?: string;
   error?: ToolError;
 }
 
@@ -399,6 +411,59 @@ function statusFor(httpStatus: number, challenge: ChallengeResult): Status {
   }
 }
 
+const EVIDENCE_MESSAGES: Record<EvidenceFailureCode, string> = {
+  evidence_exists: "An evidence record with this id already exists; it was left unchanged",
+  evidence_payload_mismatch: "A stored payload does not match its hash; it was left unchanged for investigation",
+  evidence_write_failed: "Evidence could not be written to the configured store",
+};
+
+/**
+ * Saves a successful result to the configured store. Only a confirmed save sets
+ * evidence_persisted; any failure, a thrown store included, turns the result into
+ * evidence_unavailable with a fixed message, so no path or OS error text escapes.
+ * URL fields are copied from the result, which already holds disclosed forms only.
+ */
+async function persistEvidence(result: FetchSuccess, body: Buffer, store: EvidenceStore, log: AuditLogger): Promise<void> {
+  const record: EvidenceRecord = {
+    schema_version: EVIDENCE_SCHEMA_VERSION,
+    evidence_id: randomUUID(),
+    request_id: result.request_id,
+    tool_version: result.tool_version,
+    source_url: result.source_url,
+    final_url: result.final_url,
+    redirect_chain: result.redirect_chain.map((hop) => ({ ...hop })),
+    retrieved_at: result.retrieved_at,
+    status: result.status,
+    http_status: result.http_status,
+    content_type: result.content_type,
+    challenge_type: result.challenge_type,
+    content_hash: { ...result.content_hash },
+    payload_ref: `payloads/sha256/${result.content_hash.value}`,
+    payload_bytes: body.byteLength,
+    text_truncated: result.text_truncated,
+    warnings: [...result.warnings],
+  };
+  let code: EvidenceFailureCode;
+  try {
+    const saved = await store.save(record, body);
+    if (saved.ok) {
+      result.evidence_persisted = true;
+      result.evidence_id = record.evidence_id;
+      result.payload_ref = record.payload_ref;
+      log({ event: "evidence", request_id: result.request_id, evidence_id: record.evidence_id, outcome: "saved" });
+      return;
+    }
+    // A store outside this repo could return any code; only the documented ones pass through.
+    code = Object.hasOwn(EVIDENCE_MESSAGES, saved.code) ? saved.code : "evidence_write_failed";
+  } catch {
+    code = "evidence_write_failed";
+  }
+  // A persistence outcome, not a fetch failure: the content is still returned, but it is not durable evidence.
+  result.status = "evidence_unavailable";
+  result.error = toolError("evidence_unavailable", code, EVIDENCE_MESSAGES[code]);
+  log({ event: "evidence", request_id: result.request_id, outcome: result.error.code });
+}
+
 /**
  * Bounded, read-only retrieval of a single public page. Every hop is validated
  * (URL policy -> DNS answers -> pinned connect -> peer check) before any request
@@ -501,9 +566,11 @@ export async function fetchPublicPage(
       };
       if (status !== "success") {
         result.error = toolError(status, challenge.challenge_type === "none" ? `http_${httpStatus}` : challenge.challenge_type, challenge.recommended_action);
+      } else if (deps.evidence) {
+        await persistEvidence(result, body, deps.evidence, deps.log);
       }
       // Logs carry origins only: a path or query can hold a secret, and request_id ties the line to the full result.
-      deps.log({ event: "fetch", request_id: requestId, origin: redactUrl(rawUrl, "origin"), final_origin: redactUrl(key, "origin"), status, http_status: httpStatus, peer, redirects: redirectChain.length, duration_ms: Date.now() - started });
+      deps.log({ event: "fetch", request_id: requestId, origin: redactUrl(rawUrl, "origin"), final_origin: redactUrl(key, "origin"), status: result.status, http_status: httpStatus, peer, redirects: redirectChain.length, duration_ms: Date.now() - started });
       return result;
     }
   } catch (err) {
