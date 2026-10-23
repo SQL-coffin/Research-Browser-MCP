@@ -433,7 +433,8 @@ export function extractHtml(html: string): { title: string | null; text: string 
   return { title, text };
 }
 
-function statusFor(httpStatus: number, challenge: ChallengeResult): Status {
+/** Tool status for a classified response (shared with the browser). */
+export function statusForChallenge(httpStatus: number, challenge: ChallengeResult): Status {
   switch (challenge.challenge_type) {
     case "captcha":
     case "login_required":
@@ -531,7 +532,7 @@ export async function fetchPublicPage(
       if (truncated) warnings.push("extracted_text_truncated");
 
       const challenge = classifyChallenge({ httpStatus, headers, ...(title ? { title } : {}), body: decoded.slice(0, 20_000) });
-      const status = statusFor(httpStatus, challenge);
+      const status = statusForChallenge(httpStatus, challenge);
       const retrievedAt = deps.now().toISOString();
       // Hash basis is declared; it covers the full decoded body even if text was truncated.
       const contentHash = sha256(body, "decoded_body_bytes");

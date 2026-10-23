@@ -4,7 +4,7 @@ import type { AddressInfo, Socket } from "node:net";
 import type { Duplex } from "node:stream";
 import { connectPinned, FetchStop, type ResolvedAddress } from "./fetcher.js";
 import type { AuditLogger } from "./result.js";
-import { DEFAULT_URL_POLICY, redactUrl, validateUrl, type UrlPolicy } from "./security.js";
+import { DEFAULT_URL_POLICY, EMPTY_HOST_ALLOWLIST, isUrlHostListed, redactUrl, validateUrl, type HostAllowlist, type UrlPolicy } from "./security.js";
 
 /**
  * Local forward proxy that is the browser's only route to the network. Chromium
@@ -36,6 +36,8 @@ export interface EgressPolicy extends UrlPolicy {
    * browser layer enforces the same rule on each request before it is sent.
    */
   allowedMethods: ReadonlySet<string>;
+  /** Hosts where other methods (form posts) are allowed too. Empty by default. */
+  formSubmitHosts: HostAllowlist;
 }
 
 export const DEFAULT_EGRESS_POLICY: EgressPolicy = {
@@ -46,6 +48,7 @@ export const DEFAULT_EGRESS_POLICY: EgressPolicy = {
   maxSessionBytes: 200 * 1024 * 1024,
   maxConnections: 64,
   allowedMethods: new Set(["GET", "HEAD"]),
+  formSubmitHosts: EMPTY_HOST_ALLOWLIST,
 };
 
 export interface EgressDeps {
@@ -54,6 +57,8 @@ export interface EgressDeps {
 }
 
 export interface EgressDenial {
+  /** Increases by one per denial over the proxy's lifetime. */
+  seq: number;
   /** Origin only. */
   origin: string;
   code: string;
@@ -100,6 +105,7 @@ export async function startEgressProxy(policy: EgressPolicy, deps: EgressDeps): 
   const recent: EgressDenial[] = [];
   const open = new Set<Duplex>();
   let relayed = 0;
+  let seq = 0;
   let closed = false;
 
   const authorized = (header: string | undefined): boolean => {
@@ -114,7 +120,7 @@ export async function startEgressProxy(policy: EgressPolicy, deps: EgressDeps): 
   };
 
   const deny = (origin: string, code: string) => {
-    recent.push({ origin, code, at: new Date().toISOString() });
+    recent.push({ seq: ++seq, origin, code, at: new Date().toISOString() });
     if (recent.length > 50) recent.shift();
     deps.log({ event: "egress", decision: "deny", origin, code });
   };
@@ -136,7 +142,7 @@ export async function startEgressProxy(policy: EgressPolicy, deps: EgressDeps): 
       deny(origin, check.code);
       return { status: check.status === "invalid_input" ? 400 : 403, code: check.code, origin };
     }
-    if (method !== null && !policy.allowedMethods.has(method)) {
+    if (method !== null && !policy.allowedMethods.has(method) && !isUrlHostListed(check.url, policy.formSubmitHosts)) {
       deny(origin, "method_not_allowed");
       return { status: 403, code: "method_not_allowed", origin };
     }
@@ -203,7 +209,10 @@ export async function startEgressProxy(policy: EgressPolicy, deps: EgressDeps): 
         } else res.destroy();
       });
       upstream.on("response", (up) => {
-        res.writeHead(up.statusCode ?? 502, forwardHeaders(up.headers));
+        const headers = forwardHeaders(up.headers);
+        // Only this proxy may say a request was denied by policy.
+        delete headers[DENIAL_HEADER];
+        res.writeHead(up.statusCode ?? 502, headers);
         let body = 0;
         up.on("data", (chunk: Buffer) => {
           body += chunk.length;

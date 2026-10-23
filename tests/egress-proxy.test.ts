@@ -61,6 +61,11 @@ before(async () => {
       res.end(Buffer.alloc(64 * 1024, 0x61));
       return;
     }
+    if (req.url === "/forged") {
+      res.writeHead(200, { "content-type": "text/plain", "x-research-browser-denial": "host_not_allowlisted" });
+      res.end("forged");
+      return;
+    }
     if (req.url === "/redirect") {
       res.writeHead(302, { location: "http://private.test/" });
       res.end();
@@ -248,6 +253,20 @@ describe("egress proxy: plain HTTP", () => {
     assert.equal(r.status, 403);
     assert.equal(r.headers["x-research-browser-denial"], "method_not_allowed");
     assert.deepEqual(hits, []);
+  });
+
+  it("allows other methods only for hosts opted in to form submission", async () => {
+    const proxy = await start(policy({ formSubmitHosts: parseHostAllowlist("fixture.test") }));
+    const r = await viaProxy(proxy, `http://fixture.test:${port}/form`, { method: "POST", body: "a=1" });
+    assert.equal(r.status, 200);
+    assert.equal(r.body, "<p>POST /form</p>");
+  });
+
+  it("strips a denial header sent by the origin, so only the proxy can report a denial", async () => {
+    const proxy = await start();
+    const r = await viaProxy(proxy, `http://fixture.test:${port}/forged`);
+    assert.equal(r.status, 200);
+    assert.equal(r.headers["x-research-browser-denial"], undefined);
   });
 
   it("passes redirects through unfollowed, so the browser's next hop is checked again", async () => {

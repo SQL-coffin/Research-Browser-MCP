@@ -307,6 +307,11 @@ export function isHostAllowlisted(host: string, allowlist: HostAllowlist): boole
   return allowlist.exact.has(host);
 }
 
+/** Whether the host of `url` is on `list`, keyed exactly as the fetch allowlist keys it. */
+export function isUrlHostListed(url: URL, list: HostAllowlist): boolean {
+  return isHostAllowlisted(hostKey(url.hostname), list);
+}
+
 /**
  * How host lists key a URL's host: lower case, without the trailing dot, and IP
  * addresses in canonical form. Used for both the fetch allowlist and URL
