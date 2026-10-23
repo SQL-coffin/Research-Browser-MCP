@@ -202,6 +202,7 @@ The server must not treat MCP itself as a security boundary. The client/runtime 
 - [Evidence and provenance](docs/04-evidence-and-provenance.md)
 - [Human verification and resume protocol](docs/05-human-verification-resume.md)
 - [Acceptance tests](docs/06-acceptance-tests.md)
+- [Evidence persistence contract](docs/07-evidence-persistence.md) (contract and failing tests; not implemented)
 
 ## License
 

@@ -21,6 +21,7 @@ import {
   type UrlDisclosure,
   type UrlPolicy,
 } from "./security.js";
+import type { EvidenceStore } from "./evidence.js";
 import { newRequestId, stderrAuditLogger, TOOL_VERSION, toolError, type AuditLogger, type Status, type ToolError } from "./result.js";
 
 export interface FetchPolicy extends UrlPolicy {
@@ -58,6 +59,11 @@ export interface FetchDeps {
   now: () => Date;
   /** Extra trust anchors (tests only). Never disables certificate verification. */
   tlsCa?: string | Buffer;
+  /**
+   * Durable evidence sink from startup configuration. Absent: persistence is off
+   * and nothing is written. See docs/07-evidence-persistence.md.
+   */
+  evidence?: EvidenceStore;
 }
 
 export const defaultResolve = async (hostname: string): Promise<ResolvedAddress[]> => {
@@ -98,7 +104,12 @@ export interface FetchSuccess extends Base {
   content_hash: ContentHash;
   challenge: ChallengeResult;
   challenge_type: ChallengeResult["challenge_type"];
-  evidence_persisted: false;
+  /** True only after the configured store confirmed the save. */
+  evidence_persisted: boolean;
+  /** Present only when evidence_persisted is true. */
+  evidence_id?: string;
+  /** Present only when evidence_persisted is true; relative to the sink root. */
+  payload_ref?: string;
   error?: ToolError;
 }
 
