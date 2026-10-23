@@ -198,7 +198,55 @@ const HOST_LABEL = /^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$/;
 /** A normalized (lower-case, Punycode) host name with at least two labels and no empty or malformed label. */
 function isValidHostName(host: string): boolean {
   const labels = host.split(".");
-  return host.length <= 253 && labels.length >= 2 && labels.every((label) => HOST_LABEL.test(label));
+  return (
+    host.length <= 253 &&
+    labels.length >= 2 &&
+    labels.every((label) => HOST_LABEL.test(label) && (!label.startsWith("xn--") || isValidPunycode(label.slice(4))))
+  );
+}
+
+/**
+ * Structural check of the Punycode part of an "xn--" label (RFC 3492 decoding).
+ * WHATWG URL parsers differ here: some Node builds (e.g. with a system ICU)
+ * accept truncated sequences such as "xn--zz", so the check must not depend on
+ * the parser. The decoded label must be valid Punycode, contain no C1 controls
+ * or surrogates, and contain at least one non-ASCII character. This is not a
+ * full IDNA2008 validation.
+ */
+function isValidPunycode(encoded: string): boolean {
+  const base = 36, tMin = 1, tMax = 26, skew = 38, damp = 700;
+  const delimiter = encoded.lastIndexOf("-");
+  const output: number[] = [];
+  for (let j = 0; j < Math.max(delimiter, 0); j++) output.push(encoded.charCodeAt(j));
+  const adapt = (delta: number, points: number, first: boolean) => {
+    delta = first ? Math.floor(delta / damp) : delta >> 1;
+    delta += Math.floor(delta / points);
+    let k = 0;
+    for (; delta > ((base - tMin) * tMax) >> 1; k += base) delta = Math.floor(delta / (base - tMin));
+    return k + Math.floor(((base - tMin + 1) * delta) / (delta + skew));
+  };
+  let n = 0x80, i = 0, bias = 72;
+  for (let pos = delimiter > 0 ? delimiter + 1 : 0; pos < encoded.length; ) {
+    const oldI = i;
+    for (let w = 1, k = base; ; k += base) {
+      if (pos >= encoded.length) return false; // truncated sequence
+      const c = encoded.charCodeAt(pos++);
+      const digit = c >= 0x30 && c <= 0x39 ? c - 22 : c >= 0x61 && c <= 0x7a ? c - 0x61 : base;
+      if (digit >= base) return false;
+      i += digit * w;
+      if (i > 0x10ffff * 64) return false; // overflow
+      const t = k <= bias ? tMin : k >= bias + tMax ? tMax : k - bias;
+      if (digit < t) break;
+      w *= base - t;
+    }
+    bias = adapt(i - oldI, output.length + 1, oldI === 0);
+    n += Math.floor(i / (output.length + 1));
+    i %= output.length + 1;
+    if (n > 0x10ffff) return false;
+    output.splice(i++, 0, n);
+  }
+  const isBad = (cp: number) => (cp >= 0x80 && cp <= 0x9f) || (cp >= 0xd800 && cp <= 0xdfff);
+  return output.some((cp) => cp >= 0xa0) && !output.some(isBad);
 }
 
 /**
