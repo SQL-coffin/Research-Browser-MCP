@@ -2,7 +2,7 @@ import { lookup as dnsLookup } from "node:dns/promises";
 import http from "node:http";
 import https from "node:https";
 import type { LookupFunction, Socket } from "node:net";
-import { isIP } from "node:net";
+import net, { isIP } from "node:net";
 import { Transform, type Readable } from "node:stream";
 import zlib from "node:zlib";
 import {
@@ -116,7 +116,8 @@ export interface FetchFailure extends Base {
 
 export type FetchResult = FetchSuccess | FetchFailure;
 
-class FetchStop extends Error {
+/** A policy or transport stop with the status and code reported to the caller. */
+export class FetchStop extends Error {
   constructor(
     readonly status: Status,
     readonly code: string,
@@ -144,7 +145,7 @@ export function validateDnsAnswers(answers: ResolvedAddress[], policy: UrlPolicy
   return answers[0]!;
 }
 
-async function resolveAndValidate(hostname: string, ipLiteral: string | null, policy: FetchPolicy, deps: FetchDeps): Promise<ResolvedAddress> {
+async function resolveAndValidate(hostname: string, ipLiteral: string | null, policy: UrlPolicy, deps: Pick<FetchDeps, "resolve">): Promise<ResolvedAddress> {
   let answers: ResolvedAddress[];
   if (ipLiteral) {
     answers = [{ address: ipLiteral, family: isIP(ipLiteral) === 6 ? 6 : 4 }];
@@ -180,6 +181,48 @@ export function verifyPeer(remoteAddress: string | undefined, pinned: string, po
   if (!verdict.allowed) {
     throw new FetchStop("policy_denied", `peer_${verdict.reason}`, "Connected peer address is not public");
   }
+}
+
+/**
+ * Resolves `hostname` (or takes the IP literal), validates every answer, connects
+ * to the validated address only and checks the connected peer before resolving,
+ * so no byte is written to a peer the policy rejects. Used by the browser egress
+ * proxy, which relays the browser's traffic over the returned socket.
+ * Throws FetchStop on any policy or connection failure.
+ */
+export async function connectPinned(
+  hostname: string,
+  ipLiteral: string | null,
+  port: number,
+  policy: UrlPolicy,
+  deps: Pick<FetchDeps, "resolve">,
+  timeoutMs: number,
+): Promise<{ socket: Socket; peer: string }> {
+  const pinned = await resolveAndValidate(hostname, ipLiteral, policy, deps);
+  return new Promise((resolve, reject) => {
+    // Connecting to the address itself: no lookup, so nothing can re-resolve the name.
+    const socket = net.connect({ host: pinned.address, port, family: pinned.family });
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new FetchStop("timeout", "connect_timeout", "Connection timed out"));
+    }, timeoutMs);
+    socket.prependOnceListener("connect", () => {
+      clearTimeout(timer);
+      try {
+        verifyPeer(socket.remoteAddress, pinned.address, policy);
+      } catch (err) {
+        socket.destroy();
+        reject(err);
+        return;
+      }
+      resolve({ socket, peer: canonicalAddress(socket.remoteAddress!)! });
+    });
+    socket.once("error", () => {
+      clearTimeout(timer);
+      socket.destroy();
+      reject(new FetchStop("provider_unavailable", "connection_failed", "Connection to the destination failed"));
+    });
+  });
 }
 
 interface HopResponse {
