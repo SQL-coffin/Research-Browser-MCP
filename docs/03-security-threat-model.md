@@ -67,3 +67,22 @@ On policy violation, stop the request and emit a sanitized audit result. Never s
 ## 6. Residual risks
 
 Challenge classification may be wrong or ambiguous; provider snippets may be inaccurate; source content can change after retrieval; no network filter is sufficient without egress controls at the deployment boundary. These limits must be documented and included in acceptance testing.
+
+## 7. Browser agent (optional)
+
+Enabling the browser adds page JavaScript, a real browser engine and interactive actions. Additional threats and the controls in place (details in [07 · Browser Agent](07-browser-agent.md)):
+
+| Threat | Control |
+|---|---|
+| Page script or subresource reaches an internal or unlisted address (SSRF from inside the page) | All browser traffic goes through a per-session loopback proxy with no loopback bypass; it applies the fetch policy (allowlist, every DNS answer, pinned connect, peer check) to every request and CONNECT tunnel. A request handler inside the browser re-checks every request URL first. |
+| Redirect to an unlisted or private host | Each redirect is a new request through the proxy and is checked again. |
+| Another local process or page content uses the proxy | The proxy listens on 127.0.0.1 only and requires per-proxy random credentials. |
+| Remote side effects (form posts, `fetch` writes, beacons) | Only `GET`/`HEAD` unless the host is in `RESEARCH_BROWSER_FORM_SUBMIT_HOSTS`; enforced by the proxy for plain HTTP and by the in-browser handler inside HTTPS tunnels. Clicking a submit control is refused; typing never presses Enter. |
+| Credential capture or entry | Typing into password, one-time-code and payment fields is refused; field values are never returned; password fields are masked in screenshots; typed text is never logged. |
+| State leaking between tasks | One Chromium process, fresh in-memory context and proxy per session; nothing persisted; everything released on close, timeout, crash or shutdown. |
+| Side channels around the proxy | WebSockets, service workers, downloads, QUIC and non-proxied WebRTC UDP are off; popups are closed; dialogs dismissed. |
+| CAPTCHA or access control circumvention | The page is classified after every action; any challenge pauses the session and no content, snapshot or screenshot is served until a trusted host event resumes it. No solving, fingerprint spoofing, stealth or identity rotation exists in the code. |
+| Prompt injection through page content | Snapshots and screenshots are marked untrusted; element names never include field values and are length-bounded; tool arguments cannot change policy. |
+| Resource exhaustion | Session count, idle and total lifetime limits, per-action and per-navigation timeouts, a hard deadline that closes a frozen session, per-response and per-session byte limits, bounded text, element and screenshot sizes. |
+
+Residual risks specific to the browser: a Chromium vulnerability reachable from an allowlisted page (the Chromium sandbox is off unless `RESEARCH_BROWSER_CHROMIUM_SANDBOX` is set, so run the service in a container or VM); heuristic challenge detection; side effects of `GET` requests; and the absence of a test proving that Chromium performs no DNS query of its own.

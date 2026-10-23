@@ -26,6 +26,13 @@ These are required contract tests, not evidence that tests or implementation cur
 | RB-18 | External provider is disabled or egress not approved | Request denied without fallback to unapproved provider |
 | RB-19 | Consumer sends protected case/patient data in a search query | Consumer policy blocks before external egress; server validates any enforceable contract |
 | RB-20 | Tool returns schema-invalid output or extraction error | Structured failure; invalid output is not recorded as success evidence |
+| RB-21 | Browser page loads a subresource or redirect to an unlisted, loopback or private host | Request refused by the in-browser check or the egress proxy; nothing reaches the destination |
+| RB-22 | Browser page posts a form or sends a non-GET request (plain HTTP or inside HTTPS) | Refused unless the host is opted in to form submission |
+| RB-23 | Agent types into a password, one-time-code or payment field | `policy_denied`; nothing typed; text never logged |
+| RB-24 | Two browser sessions on the same site | No cookie or storage crosses between them |
+| RB-25 | Browser reaches a CAPTCHA, login, 429 or 403 page | Session `BLOCKED` with a handoff; no content, snapshot or screenshot served until a trusted event resumes it |
+| RB-26 | Browser session is idle, exceeds its lifetime, freezes, or the server stops | Session closed; no browser process remains |
+| RB-27 | Evidence is persisted | Stored bytes hash to the declared value and basis; records hold origins only |
 
 ## Test strategy
 

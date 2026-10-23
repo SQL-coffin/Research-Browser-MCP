@@ -29,7 +29,7 @@ Output: `status`, `results[]`, `provider`, `provider_version`, `retrieved_at`, `
 
 Input: `url` and optional bounded extraction settings allowed by server policy. Callers cannot override network safety controls.
 
-Output: `status`, `source_url`, `final_url`, `title`, `retrieved_at`, `content_type`, `http_status`, `extracted_text`, `content_hash`, `redirect_chain`, `warnings`, `challenge_type`, `request_id`.
+Output: `status`, `source_url`, `final_url`, `title`, `retrieved_at`, `content_type`, `http_status`, `extracted_text`, `content_hash`, `redirect_chain`, `warnings`, `challenge_type`, `request_id`, `evidence_status` (`disabled`, `persisted`, `failed`), `evidence_persisted` (true only after the stored bytes were read back with the declared hash), and `evidence_id` or `evidence_error`.
 
 Rules: HTTPS by default; strict destination-IP validation; bounded redirects, timeouts, response bytes, decompressed bytes, and extracted characters; no JavaScript, forms, credential forwarding, browser sessions, or automatic arbitrary file downloads.
 
@@ -63,3 +63,7 @@ An MCP service can expose the handoff protocol, but durable `BLOCKED` state and 
 - `internal_error`
 
 Any non-success status must include a stable error code, a safe message, and a retryable flag. `retryable` never overrides caller budgets or site policy.
+
+## 7. Browser tools (optional)
+
+Registered only when `RESEARCH_BROWSER_ENABLE_BROWSER` is on: `browser.open_session`, `browser.navigate`, `browser.snapshot`, `browser.click`, `browser.type`, `browser.scroll`, `browser.screenshot`, `browser.pause_for_human`, `browser.resume_session`, `browser.close_session`. Inputs are a session UUID plus bounded action arguments (`url`, element `index`, `text` ≤ 2,000 characters, scroll `direction`/`pixels`, `full_page`, `host_event_ref`); none can change hosts, methods, headers, cookies, timeouts or any other policy. Every result has `status`, `request_id`, `session_id`, `session_state`, `warnings` and, on failure, `error`. A page showing a challenge returns a pause with a `handoff` instead of content. Details and fields: [07 · Browser Agent](07-browser-agent.md).

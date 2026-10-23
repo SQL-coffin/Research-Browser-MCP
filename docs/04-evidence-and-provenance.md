@@ -46,3 +46,7 @@ If the same URL yields different content, create distinct evidence records. Pres
 ## 7. Privacy
 
 Do not persist credentials, session identifiers, or protected user data. Query strings and redirect targets may contain secrets; redact them in logs and consider a safe-display URL alongside the actual request URL in restricted storage.
+
+## 8. Implemented store
+
+`src/evidence.ts` implements an opt-in file store (`RESEARCH_BROWSER_EVIDENCE_DIR`, absolute path). Each capture writes `records/<evidence_id>.json` (kind, `content_hash` with its basis, byte length, media type, origin, request and session IDs, HTTP status, capture time, tool version) and the exact hashed bytes at `objects/sha256/<hex>`. Objects are written once (staged, fsynced, read-only, hard-linked, read back and re-hashed) and are never overwritten; a corrupted or symlinked object fails the capture. The store refuses bytes that do not match the declared hash or basis. Hash bases in use: `decoded_body_bytes` (fetcher and browser main document), `rendered_dom_utf8` (browser snapshot), `screenshot_png_bytes` (browser screenshot). Records hold the origin only, never path, query, headers or cookies. Results report `evidence_status` and set `evidence_persisted: true` only after the read-back check.

@@ -75,3 +75,7 @@ Human review may select another public, authorized source. The browser should re
 ## 7. User experience
 
 The handoff should explain the reason, what has already completed, what human action is needed, what data will be retained, and how to cancel or use an alternate source. It must avoid implying that access is guaranteed after verification.
+
+## Browser sessions
+
+A browser session that reaches a challenge page, or whose caller calls `browser.pause_for_human`, is paused through the same `HandoffStore`, with the session id as `task_id`. The resume handle stays on the server: `browser.resume_session` takes only the host event reference. While paused, the session serves no action, snapshot or screenshot. After `verified_and_continue` the page is checked again and a fresh pause is recorded if the challenge is still there; `choose_alternate_source` leaves the session on `about:blank`; `cancel` closes it. In headed mode a person can see and use the window, but the person's traffic is subject to the same allowlist and method rule. See [07 · Browser Agent](07-browser-agent.md#6-human-takeover-and-resume).

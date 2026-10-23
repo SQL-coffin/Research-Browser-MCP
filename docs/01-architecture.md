@@ -17,6 +17,7 @@ Research Browser MCP Server
   +-- Provider Registry
   +-- Search Adapter (optional)
   +-- Public Page Fetcher
+  +-- Browser Agent (optional) --> Egress Proxy (same policy as the fetcher)
   +-- Challenge Classifier
   +-- Result Normalizer
   +-- Evidence Metadata Writer
@@ -35,9 +36,11 @@ The host runtime enforces its own tool registry, mode restrictions, data-scope c
 | Provider Registry | Resolve explicitly configured providers and versions | Discover or enable arbitrary providers at runtime |
 | Search Adapter | Query an approved search provider | Send protected user/case data |
 | Public Page Fetcher | Retrieve bounded public HTML/text | Execute page scripts, submit forms, reuse sessions |
+| Browser Agent (optional) | Isolated Chromium sessions on allowlisted hosts; indexed snapshots and bounded actions; pause on challenges | Solve or bypass challenges, share state between sessions, submit forms on hosts not opted in |
+| Egress Proxy | The browser's only network route; applies the fetch policy to every request and tunnel | Terminate TLS, accept connections from anything but its own session |
 | Challenge Classifier | Classify visible access challenges | Solve or bypass them |
 | Result Normalizer | Convert provider results to stable envelopes | Treat page text as instructions |
-| Evidence Metadata Writer | Emit provenance and hashes or evidence payloads to a configured sink | Claim persistence when the sink is not configured |
+| Evidence Store (optional) | Write the exact hashed bytes and an origin-only record, once | Overwrite, follow symlinks, store headers or cookies, claim persistence it did not verify |
 
 ## 4. Trust boundaries
 
@@ -69,3 +72,7 @@ Phase 2: evidence/provenance, safe challenge handoff, provider integration.
 Phase 3: consumer integration tests and operational hardening.
 
 Do not use real patient or otherwise protected data during early development or acceptance testing.
+
+## 9. Browser agent
+
+See [07 · Browser Agent](07-browser-agent.md). The browser does not get a separate network policy: its proxy and in-browser request checks use the fetch policy built from `RESEARCH_BROWSER_ALLOWED_HOSTS`. A challenge pauses the session through the same `HandoffStore` as `research.pause_for_human`; the host's trusted event channel remains the only way to resume.
