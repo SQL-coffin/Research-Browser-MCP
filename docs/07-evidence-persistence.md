@@ -1,8 +1,8 @@
 # 07 · Evidence Persistence Contract
 
-Version: v0.1 contract (not implemented)
+Version: v0.1
 
-This document fixes how `research.fetch_public_page` may persist source evidence. It refines §5 of [Evidence and provenance](04-evidence-and-provenance.md). Types live in `src/evidence.ts`; the required behaviour is pinned by `tests/evidence.test.ts`. Until the implementation lands, those tests fail and every result keeps `evidence_persisted: false`.
+This document fixes how `research.fetch_public_page` may persist source evidence. It refines §5 of [Evidence and provenance](04-evidence-and-provenance.md). The implementation lives in `src/evidence.ts` and `src/fetcher.ts`; the required behaviour is pinned by `tests/evidence.test.ts`.
 
 ## 1. Off by default
 
@@ -49,6 +49,7 @@ Under the configured root:
 | Save failed (any code, or the store threw) | `evidence_unavailable` | `false` | absent | `{ code: <failure code>, retryable: false }` |
 
 - `evidence_persisted: true` is reported only after the store confirmed the save. A failure never yields `true`.
+- `evidence_unavailable` is a status about persistence, not about retrieval. It means this call did not produce a durable evidence record that meets this contract; it does not mean the HTTP fetch failed or that the returned text is unusable. Callers decide what to do with it: retry the save by fetching again, use the content as transient information only, or stop work that depends on citable evidence.
 - On a save failure the fetched content is still returned (`extracted_text`, `content_hash`, …), but the status tells the caller that this result is not durable evidence. The operator asked for durable evidence; a quiet `success` would let it be cited as if it were.
 - `payload_ref` is relative to the root. The root path never appears in results, errors or logs.
 
