@@ -13,7 +13,7 @@ jobs:
     name: Typecheck, test, build
     # Pinned image: the test step relies on Ubuntu 24.04's AppArmor userns sysctl.
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
         with:
@@ -27,6 +27,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install Chromium for the browser tests
+        # The build that matches the pinned playwright-core, plus its system
+        # libraries. Downloaded here, before the tests lose network access.
+        run: npx playwright-core install --with-deps chromium-headless-shell
+
       - name: Typecheck (strict, src and tests)
         run: npm run typecheck
 
@@ -38,7 +43,8 @@ jobs:
         # Fixtures listen on 127.0.0.1 and resolvers are injected, so the suite
         # needs no network. Running it in a fresh network namespace that only has
         # loopback turns any attempt to reach a real host into a failure.
-        # CI=true (set by Actions) also forbids skipping the HTTPS tests.
+        # CI=true (set by Actions) also forbids skipping the HTTPS and browser tests.
+        # The browser tests drive real Chromium through the egress proxy.
         run: unshare --map-root-user --net bash -c 'ip link set lo up && npm test'
 
       - name: Build
@@ -50,5 +56,8 @@ jobs:
         #   (initialize, tools/list, default-deny fetches); every child process is
         #   time-limited and killed, even when a test fails;
         # - runs the compiled fetch path and MCP result handling against local
-        #   HTTP/HTTPS fixtures.
+        #   HTTP/HTTPS fixtures;
+        # - starts dist/index.js with the browser enabled, and runs the compiled
+        #   browser modules against a local fixture; no browser process may outlive
+        #   its session or the server.
         run: unshare --map-root-user --net bash -c 'ip link set lo up && npm run test:smoke'
