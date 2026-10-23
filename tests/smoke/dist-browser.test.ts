@@ -100,8 +100,13 @@ function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<
 }
 
 function start(env: Record<string, string>) {
-  // Only what the browser needs to find its build is passed through; no allowlist.
-  const passthrough = process.env.PLAYWRIGHT_BROWSERS_PATH ? { PLAYWRIGHT_BROWSERS_PATH: process.env.PLAYWRIGHT_BROWSERS_PATH } : {};
+  // Only what the browser needs to find its build and its shared libraries is passed
+  // through (the transport otherwise keeps just PATH, HOME and similar); no allowlist.
+  const passthrough: Record<string, string> = {};
+  for (const key of ["PLAYWRIGHT_BROWSERS_PATH", "LD_LIBRARY_PATH"]) {
+    const value = process.env[key];
+    if (value) passthrough[key] = value;
+  }
   const transport = new StdioClientTransport({ command: process.execPath, args: [SERVER], env: { ...passthrough, ...env }, cwd: ROOT, stderr: "pipe" });
   let stderr = "";
   transport.stderr?.on("data", (c) => (stderr += String(c)));
