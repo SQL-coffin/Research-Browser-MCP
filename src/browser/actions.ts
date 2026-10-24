@@ -105,7 +105,9 @@ export function navigationErrorToken(message: string): string | undefined {
 }
 
 /** Proxy error codes raised before a connection to the destination exists. */
-const PRE_CONNECTION_ERRORS = new Set(["dns_resolution_failed", "dns_no_answer", "connection_failed", "connect_timeout"]);
+const PRE_CONNECTION_ERRORS = new Set(["dns_resolution_failed", "dns_no_answer", "dns_timeout", "connection_failed", "connect_timeout"]);
+/** Pre-connection proxy errors that are timeouts rather than failures. */
+const TIMEOUT_ERRORS = new Set(["dns_timeout", "connect_timeout"]);
 
 interface Marks {
   proxy: number;
@@ -250,7 +252,7 @@ export class BrowserAgent {
         if (denied !== undefined && PROXY_CODE.test(denied)) throw new ActionStop("policy_denied", denied, "A request in the redirect chain was refused by policy");
         const failed = headers[PROXY_ERROR_HEADER];
         if (failed !== undefined && PROXY_CODE.test(failed)) {
-          throw new ActionStop(failed === "connect_timeout" ? "timeout" : "provider_unavailable", failed, "Navigation failed at the proxy while reaching the destination");
+          throw new ActionStop(TIMEOUT_ERRORS.has(failed) ? "timeout" : "provider_unavailable", failed, "Navigation failed at the proxy while reaching the destination");
         }
       }
       const redirects: string[] = [];
@@ -615,7 +617,7 @@ export class BrowserAgent {
     if (ownDenial) return new ActionStop("policy_denied", ownDenial.code, "Navigation was refused by policy", withNet);
     if (netError && isTlsErrorToken(netError)) return new ActionStop("policy_denied", "tls_verification_failed", "TLS certificate verification failed", withNet);
     if (ownConnectError) {
-      const status: Status = ownConnectError.code === "connect_timeout" ? "timeout" : "provider_unavailable";
+      const status: Status = TIMEOUT_ERRORS.has(ownConnectError.code) ? "timeout" : "provider_unavailable";
       return new ActionStop(status, ownConnectError.code, "Navigation failed while connecting to the destination", withNet);
     }
     if (err instanceof playwrightErrors.TimeoutError) return new ActionStop("timeout", "navigation_timeout", "Navigation timed out");
