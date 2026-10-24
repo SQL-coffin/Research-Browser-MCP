@@ -438,6 +438,9 @@ export function redactUrl(raw: string, mode: "display" | "origin" = "display"): 
   } catch {
     return "[unparseable-url]";
   }
+  // The URL parser accepts host names of any length; DNS names stop at 253 characters.
+  // A longer one cannot be fetched, and is not echoed into results or logs.
+  if (url.hostname.length > 253) return "[invalid-host]";
   if (mode === "origin") return url.protocol === "https:" || url.protocol === "http:" ? url.origin : "[non-http-url]";
   url.username = "";
   url.password = "";

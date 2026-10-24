@@ -77,13 +77,18 @@ export interface EgressProxy {
   readonly password: string;
   /** The most recent policy denials (at most 50), newest last. */
   denials(): readonly EgressDenial[];
-  /** The most recent origin-only denials and connection errors (at most 50). */
+  /**
+   * The most recent denials and errors, in seq order. Each kind keeps its own
+   * newest 50, so a burst of errors never pushes a denial out.
+   */
   events(): readonly EgressDiagnostic[];
   bytesRelayed(): number;
   close(): Promise<void>;
 }
 
 export const DENIAL_HEADER = "x-research-browser-denial";
+/** Set on plain-HTTP error replies the proxy writes itself (never on a destination's reply). */
+export const PROXY_ERROR_HEADER = "x-research-browser-proxy-error";
 
 const HOP_BY_HOP = new Set(["connection", "keep-alive", "proxy-authorization", "proxy-authenticate", "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade"]);
 
@@ -109,7 +114,8 @@ export async function startEgressProxy(policy: EgressPolicy, deps: EgressDeps): 
   const username = "rbmcp";
   const password = randomBytes(24).toString("base64url");
   const expected = Buffer.from(`Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`);
-  const recent: EgressDiagnostic[] = [];
+  const recentDenials: EgressDenial[] = [];
+  const recentErrors: EgressDiagnostic[] = [];
   const open = new Set<Duplex>();
   let relayed = 0;
   let seq = 0;
@@ -127,8 +133,10 @@ export async function startEgressProxy(policy: EgressPolicy, deps: EgressDeps): 
   };
 
   const record = (origin: string, code: string, kind: "error" | "deny") => {
-    recent.push({ seq: ++seq, origin, code, kind, at: new Date().toISOString() });
-    if (recent.length > 50) recent.shift();
+    const event = { seq: ++seq, origin, code, at: new Date().toISOString() };
+    const buffer: EgressDiagnostic[] = kind === "deny" ? recentDenials : recentErrors;
+    buffer.push({ ...event, kind });
+    if (buffer.length > 50) buffer.shift();
     deps.log({ event: "egress", decision: kind, kind, origin, code });
   };
   const deny = (origin: string, code: string) => record(origin, code, "deny");
@@ -139,6 +147,25 @@ export async function startEgressProxy(policy: EgressPolicy, deps: EgressDeps): 
     if (relayed > policy.maxSessionBytes) {
       for (const s of open) s.destroy();
     }
+  };
+
+  /**
+   * Records `upstream_error` once per admitted connection when the destination
+   * side fails before the response or tunnel ended normally. Closes this proxy
+   * caused itself (idle timeout, byte limits, shutdown) are not errors.
+   */
+  const upstreamFailure = (origin: string) => {
+    let settled = false;
+    return {
+      quiet: () => {
+        settled = true;
+      },
+      fail: () => {
+        if (settled || closed || relayed > policy.maxSessionBytes) return;
+        settled = true;
+        record(origin, "upstream_error", "error");
+      },
+    };
   };
 
   /** Shared checks for both request kinds. Returns the connected upstream socket or a denial. */
@@ -160,7 +187,7 @@ export async function startEgressProxy(policy: EgressPolicy, deps: EgressDeps): 
     }
     try {
       const { socket, peer } = await connectPinned(check.hostname, check.ipLiteral, check.port, policy, deps, policy.connectTimeoutMs);
-      deps.log({ event: "egress", decision: "allow", origin, peer, kind: method === null ? "tunnel" : "http" });
+      deps.log({ event: "egress", decision: "allow", origin, peer, transport: method === null ? "tunnel" : "http" });
       return { socket, origin };
     } catch (err) {
       const stop = err instanceof FetchStop ? err : new FetchStop("provider_unavailable", "connection_failed", "Connection failed");
@@ -195,7 +222,7 @@ export async function startEgressProxy(policy: EgressPolicy, deps: EgressDeps): 
       const method = (req.method ?? "GET").toUpperCase();
       const admitted = await admit(target, method);
       if ("status" in admitted) {
-        res.writeHead(admitted.status, { ...(admitted.kind === "deny" ? { [DENIAL_HEADER]: admitted.code } : {}), "content-type": "text/plain", connection: "close" });
+        res.writeHead(admitted.status, { [admitted.kind === "deny" ? DENIAL_HEADER : PROXY_ERROR_HEADER]: admitted.code, "content-type": "text/plain", connection: "close" });
         res.end(`Blocked by research-browser policy: ${admitted.code}\n`);
         req.resume();
         return;
@@ -203,7 +230,11 @@ export async function startEgressProxy(policy: EgressPolicy, deps: EgressDeps): 
       const url = new URL(target);
       const upstreamSocket = admitted.socket;
       track(upstreamSocket);
-      upstreamSocket.setTimeout(policy.idleTimeoutMs, () => upstreamSocket.destroy());
+      const failure = upstreamFailure(admitted.origin);
+      upstreamSocket.setTimeout(policy.idleTimeoutMs, () => {
+        failure.quiet();
+        upstreamSocket.destroy();
+      });
       const upstream = http.request({
         method,
         path: `${url.pathname}${url.search}`,
@@ -211,15 +242,17 @@ export async function startEgressProxy(policy: EgressPolicy, deps: EgressDeps): 
         createConnection: () => upstreamSocket,
       });
       upstream.on("error", () => {
+        failure.fail();
         if (!res.headersSent) {
-          res.writeHead(502, { connection: "close", "content-length": 0 });
+          res.writeHead(502, { [PROXY_ERROR_HEADER]: "upstream_error", connection: "close", "content-length": 0 });
           res.end();
         } else res.destroy();
       });
       upstream.on("response", (up) => {
         const headers = forwardHeaders(up.headers);
-        // Only this proxy may say a request was denied by policy.
+        // Only this proxy may say a request was denied by policy or failed at the proxy.
         delete headers[DENIAL_HEADER];
+        delete headers[PROXY_ERROR_HEADER];
         res.writeHead(up.statusCode ?? 502, headers);
         let body = 0;
         up.on("data", (chunk: Buffer) => {
@@ -227,15 +260,25 @@ export async function startEgressProxy(policy: EgressPolicy, deps: EgressDeps): 
           count(chunk.length);
           if (body > policy.maxResponseBytes) {
             deny(admitted.origin, "response_too_large");
+            failure.quiet();
             up.destroy();
             res.destroy();
             return;
           }
           res.write(chunk);
         });
-        up.on("end", () => res.end());
-        up.on("error", () => res.destroy());
-        up.on("aborted", () => res.destroy());
+        up.on("end", () => {
+          failure.quiet();
+          res.end();
+        });
+        up.on("error", () => {
+          failure.fail();
+          res.destroy();
+        });
+        up.on("aborted", () => {
+          failure.fail();
+          res.destroy();
+        });
       });
       req.on("data", (chunk: Buffer) => count(chunk.length));
       req.pipe(upstream);
@@ -272,14 +315,24 @@ export async function startEgressProxy(policy: EgressPolicy, deps: EgressDeps): 
         count(head.length);
         upstream.write(head);
       }
+      const failure = upstreamFailure(admitted.origin);
       const idle = () => {
+        failure.quiet();
         upstream.destroy();
         client.destroy();
       };
       upstream.setTimeout(policy.idleTimeoutMs, idle);
-      upstream.on("data", (d: Buffer) => count(d.length));
+      upstream.on("data", (d: Buffer) => {
+        // Once the destination has sent bytes, a reset cannot be told apart from the
+        // end of a normal exchange inside an opaque tunnel, so it is not an error.
+        failure.quiet();
+        count(d.length);
+      });
       client.on("data", (d: Buffer) => count(d.length));
-      upstream.on("error", () => client.destroy());
+      upstream.on("error", () => {
+        failure.fail();
+        client.destroy();
+      });
       upstream.on("close", () => client.destroy());
       client.on("close", () => upstream.destroy());
       upstream.pipe(client);
@@ -308,8 +361,8 @@ export async function startEgressProxy(policy: EgressPolicy, deps: EgressDeps): 
     port,
     username,
     password,
-    denials: () => recent.filter((event): event is EgressDenial => event.kind === "deny"),
-    events: () => [...recent],
+    denials: () => [...recentDenials],
+    events: () => [...recentDenials, ...recentErrors].sort((a, b) => a.seq - b.seq),
     bytesRelayed: () => relayed,
     close: () =>
       new Promise<void>((resolve) => {

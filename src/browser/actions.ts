@@ -1,5 +1,5 @@
 import { errors as playwrightErrors, type ElementHandle, type JSHandle } from "playwright-core";
-import { DENIAL_HEADER } from "../egress-proxy.js";
+import { DENIAL_HEADER, PROXY_ERROR_HEADER } from "../egress-proxy.js";
 import { NO_EVIDENCE, type EvidenceKind, type EvidenceOutcome } from "../evidence.js";
 import { statusForChallenge } from "../fetcher.js";
 import { newRequestId, toolError, type Status, type ToolError } from "../result.js";
@@ -71,6 +71,41 @@ export interface ScreenshotResult {
   result: BrowserResult;
   png: Buffer | null;
 }
+
+/** A code the proxy writes into its own reply headers. */
+const PROXY_CODE = /^[a-z0-9_]{1,64}$/;
+
+/** Chromium errors that mean the destination's certificate or TLS handshake was refused. */
+const TLS_ERROR = /^net::ERR_(CERT_[A-Z0-9_]+|CERTIFICATE_[A-Z0-9_]+|SSL_[A-Z0-9_]+|BAD_SSL_[A-Z0-9_]+|TLS13_DOWNGRADE_DETECTED|ECH_FALLBACK_CERTIFICATE_INVALID)$/;
+
+/** Whether a Chromium error token reports a certificate or TLS handshake failure. */
+export function isTlsErrorToken(token: string): boolean {
+  return TLS_ERROR.test(token);
+}
+
+/** The first line of a Playwright error, without the " at <url>" suffix that names the requested URL. */
+function firstLine(err: unknown): string {
+  const line = (err instanceof Error ? err.message : "").split("\n")[0] ?? "";
+  const at = line.indexOf(" at ");
+  return at === -1 ? line : line.slice(0, at);
+}
+
+/** The Chromium error token of a navigation error, never taken from the URL or the call log. */
+function netErrorToken(err: unknown): string | undefined {
+  return navigationErrorToken(err instanceof Error ? err.message : "");
+}
+
+/**
+ * The token a Playwright navigation error starts with ("page.goto: net::ERR_X at <url>"
+ * or "net::ERR_X; ..."), or undefined. Anchored to the start of the message, because
+ * other messages quote URLs a page may have chosen. Exported for tests.
+ */
+export function navigationErrorToken(message: string): string | undefined {
+  return /^(?:[\w.]+: )?(net::ERR_[A-Z0-9_]+)\b/.exec(message)?.[1];
+}
+
+/** Proxy error codes raised before a connection to the destination exists. */
+const PRE_CONNECTION_ERRORS = new Set(["dns_resolution_failed", "dns_no_answer", "connection_failed", "connect_timeout"]);
 
 interface Marks {
   proxy: number;
@@ -158,7 +193,7 @@ export class BrowserAgent {
     if (!session) return this.fail(request_id, id, "invalid_input", "unknown_session", "No open browser session has this id");
     this.sessions.delete(id);
     const result: BrowserResult = { status: "success", request_id, session_id: id, session_state: "CLOSED", warnings: [], blocked_requests: [], failed_requests: [] };
-    this.attachDiagnostics(session, result);
+    this.attachDiagnostics(session, result, session.state === "BLOCKED");
     await session.close("closed_by_caller");
     return result;
   }
@@ -203,19 +238,21 @@ export class BrowserAgent {
       try {
         response = await s.page.goto(check.url.toString(), { waitUntil: "domcontentloaded" });
       } catch (err) {
-        throw this.navigationError(s, marks, err);
+        throw this.navigationError(s, marks, err, redactUrl(check.url.toString(), "origin"));
       }
-      const responseOrigin = response ? redactUrl(response.url(), "origin") : null;
-      const proxyError = response && response.status() >= 500 && responseOrigin
-        ? s.proxy.events().filter((event) => event.kind === "error" && event.seq > marks.proxy && event.origin === responseOrigin).at(-1)
-        : undefined;
-      if (proxyError) {
-        const failedRequest = s.failedRequests.filter((item) => item.seq > marks.failed && item.origin === responseOrigin && item.error_text?.startsWith("net::ERR_")).at(-1);
-        const status: Status = proxyError.code === "connect_timeout" ? "timeout" : "provider_unavailable";
-        throw new ActionStop(status, proxyError.code, "Navigation failed while connecting to the destination", failedRequest?.error_text ? { net_error: failedRequest.error_text } : {});
+      // A plain-HTTP reply may have been written by the proxy itself (a denial or a
+      // connection error on some hop). Every plain-HTTP reply passes the proxy, which
+      // removes both headers from destination replies, so on http: they can only be
+      // the proxy's own. HTTPS replies always come from the destination: never read.
+      if (response && new URL(response.url()).protocol === "http:") {
+        const headers = response.headers();
+        const denied = headers[DENIAL_HEADER];
+        if (denied !== undefined && PROXY_CODE.test(denied)) throw new ActionStop("policy_denied", denied, "A request in the redirect chain was refused by policy");
+        const failed = headers[PROXY_ERROR_HEADER];
+        if (failed !== undefined && PROXY_CODE.test(failed)) {
+          throw new ActionStop(failed === "connect_timeout" ? "timeout" : "provider_unavailable", failed, "Navigation failed at the proxy while reaching the destination");
+        }
       }
-      const denied = response?.headers()[DENIAL_HEADER];
-      if (denied) throw new ActionStop("policy_denied", denied, "A request in the redirect chain was refused by policy");
       const redirects: string[] = [];
       for (let req = response?.request().redirectedFrom(); req; req = req.redirectedFrom()) redirects.unshift(this.show(req.url()));
       r.redirect_chain = redirects;
@@ -232,7 +269,6 @@ export class BrowserAgent {
           await this.persist(s, r, body, "browser_response_body", "decoded_body_bytes", response.headers()["content-type"]?.split(";")[0]?.trim() || "application/octet-stream", response.status());
         }
       }
-      this.blockedSince(s, marks, r);
       return this.afterAction(s, r, "navigate");
     });
   }
@@ -290,12 +326,10 @@ export class BrowserAgent {
         throw new ActionStop("policy_denied", "form_submission_disabled", "Submitting forms is disabled for this host by server configuration");
       }
       const before = s.page.url();
-      const marks = this.marks(s);
       await el.click({ timeout: this.config.actionTimeoutMs });
       await this.settle(s);
       r.navigated = s.page.url() !== before;
       if (r.navigated) await s.disposeElements();
-      this.blockedSince(s, marks, r);
       return this.afterAction(s, r, "click");
     });
   }
@@ -426,11 +460,14 @@ export class BrowserAgent {
           session_state: "BLOCKED",
           ...(session.pause ? { handoff_pause_id: session.pause.pause_id } : {}),
         };
-        this.attachDiagnostics(session, paused);
+        this.attachDiagnostics(session, paused, true);
         return paused;
       }
       session.lastUsedAt = Date.now();
       session.warnings.clear();
+      // Requests made while the session was paused (by the page, or by a person in a
+      // visible window) are not reported to the caller, including by resume itself.
+      const suppress = session.state === "BLOCKED";
       const r: BrowserResult = { status: "success", request_id, session_id: id, session_state: session.state, warnings: [] };
       // Hard deadline: a page that hangs the renderer (or evaluate) cannot hold
       // the session forever. Past it, the whole session is closed.
@@ -443,12 +480,12 @@ export class BrowserAgent {
         const out = await Promise.race([fn(session, r), deadline]);
         if (out === "deadline") {
           const timedOut = { ...this.fail(request_id, id, "timeout", "action_deadline_exceeded", "The action did not finish in time; the session was closed"), session_state: "CLOSED" as const };
-          this.attachDiagnostics(session, timedOut);
+          this.attachDiagnostics(session, timedOut, suppress);
           this.sessions.delete(id);
           await session.close("action_deadline_exceeded");
           return timedOut;
         }
-        this.attachDiagnostics(session, out);
+        this.attachDiagnostics(session, out, suppress);
         out.session_state = session.state;
         if (!session.isClosed) {
           out.url ??= this.show(session.page.url());
@@ -459,7 +496,7 @@ export class BrowserAgent {
       } catch (err) {
         const stop = this.toStop(err);
         const failed = { ...r, status: stop.status, error: toolError(stop.status, stop.code, stop.message), session_state: session.state, ...stop.extra, ...(!session.isClosed ? { url: this.show(session.page.url()) } : {}) };
-        this.attachDiagnostics(session, failed);
+        this.attachDiagnostics(session, failed, suppress);
         return failed;
       } finally {
         clearTimeout(timer);
@@ -518,7 +555,7 @@ export class BrowserAgent {
     await s.page.waitForLoadState("domcontentloaded", { timeout: this.config.navigationTimeoutMs }).catch(() => {});
   }
 
-  /** Sequence numbers of the newest denials so far, in the browser and in the proxy. */
+  /** The newest sequence numbers so far: proxy events, in-browser refusals, failed requests. */
   private marks(s: BrowserSession): Marks {
     return { proxy: s.proxy.events().at(-1)?.seq ?? 0, context: s.blockedRequests.at(-1)?.seq ?? 0, failed: s.failedRequests.at(-1)?.seq ?? 0 };
   }
@@ -526,52 +563,70 @@ export class BrowserAgent {
   private newDenials(s: BrowserSession, marks: Marks): { origin: string; code: string }[] {
     return [
       ...s.blockedRequests.filter((d) => d.seq > marks.context),
-      ...s.proxy.events().filter((d) => d.kind === "deny" && d.seq > marks.proxy),
+      ...s.proxy.denials().filter((d) => d.seq > marks.proxy),
     ].map((d) => ({ origin: d.origin, code: d.code }));
   }
 
-  /** Attach bounded, origin-only diagnostics since the previous browser result. */
-  private attachDiagnostics(s: BrowserSession, r: BrowserResult): void {
+  /**
+   * Attaches the origin-only diagnostics recorded since the previous result of this
+   * session (at most 20 per list) and marks them reported. With `suppress` (the
+   * session is paused) they are marked reported but not returned.
+   */
+  private attachDiagnostics(s: BrowserSession, r: BrowserResult, suppress = false): void {
     const contextBlocked = s.blockedRequests.filter((d) => d.seq > s.lastReportedBlockedContextSeq);
-    const proxyBlocked = s.proxy.events().filter((d) => d.kind === "deny" && d.seq > s.lastReportedBlockedProxySeq);
-    const blocked = [
-      ...contextBlocked.map(({ origin, code }) => ({ origin, code })),
-      ...proxyBlocked.map(({ origin, code }) => ({ origin, code })),
-    ];
-    r.blocked_requests = blocked.slice(-20);
-    s.lastReportedBlockedContextSeq = Math.max(s.lastReportedBlockedContextSeq, ...contextBlocked.map((d) => d.seq), 0);
-    s.lastReportedBlockedProxySeq = Math.max(s.lastReportedBlockedProxySeq, ...proxyBlocked.map((d) => d.seq), 0);
+    const proxyBlocked = s.proxy.denials().filter((d) => d.seq > s.lastReportedBlockedProxySeq);
     const failed = s.failedRequests.filter((d) => d.seq > s.lastReportedFailedSeq);
+    s.lastReportedBlockedContextSeq = Math.max(s.lastReportedBlockedContextSeq, ...contextBlocked.map((d) => d.seq));
+    s.lastReportedBlockedProxySeq = Math.max(s.lastReportedBlockedProxySeq, ...proxyBlocked.map((d) => d.seq));
+    s.lastReportedFailedSeq = Math.max(s.lastReportedFailedSeq, ...failed.map((d) => d.seq));
+    if (suppress) {
+      r.blocked_requests = [];
+      r.failed_requests = [];
+      if (contextBlocked.length || proxyBlocked.length || failed.length) r.warnings.push("request_diagnostics_suppressed_while_paused");
+      return;
+    }
+    const blocked = [...contextBlocked, ...proxyBlocked].map(({ origin, code }) => ({ origin, code }));
+    r.blocked_requests = blocked.slice(-20);
     r.failed_requests = failed.slice(-20).map(({ origin, resource_type, status, error_text }) => ({ origin, resource_type, ...(status === undefined ? {} : { status }), ...(error_text ? { error_text } : {}) }));
-    s.lastReportedFailedSeq = Math.max(s.lastReportedFailedSeq, ...failed.map((d) => d.seq), 0);
+    // Every buffer keeps 50 entries per kind, so losing an unreported entry also
+    // means more than 20 were new: one rule covers both.
+    if (blocked.length > 20 || failed.length > 20) r.warnings.push("request_diagnostics_truncated");
     if (blocked.length && !r.warnings.includes("requests_blocked_by_policy")) r.warnings.push("requests_blocked_by_policy");
   }
 
-  private blockedSince(s: BrowserSession, marks: Marks, r: BrowserResult): void {
-    const blocked = this.newDenials(s, marks);
-    if (blocked.length) {
-      r.blocked_requests = blocked.slice(-20);
-      r.warnings.push("requests_blocked_by_policy");
-    }
-  }
+  /**
+   * Explains a failed navigation from the navigation's own requests: the requested
+   * origin plus the origin of every main-frame navigation request that failed since
+   * the mark (redirect targets show up there; the in-browser check never sees
+   * redirect hops). Other requests, such as the previous page's background traffic
+   * or its iframes, decide the outcome only when nothing else does.
+   */
+  private navigationError(s: BrowserSession, marks: Marks, err: unknown, requestedOrigin: string): ActionStop {
+    const netError = netErrorToken(err);
+    const withNet = netError ? { net_error: netError } : {};
+    const chain = new Set([requestedOrigin, ...s.failedRequests.filter((f) => f.seq > marks.failed && f.main_frame).map((f) => f.origin)]);
+    // Only the proxy can refuse a navigation hop: navigate checked the URL itself, and
+    // the in-browser check never sees redirect hops.
+    const ownDenial = s.proxy.denials().filter((d) => d.seq > marks.proxy && chain.has(d.origin)).at(-1);
+    const ownErrors = s.proxy.events().filter((d) => d.kind === "error" && d.seq > marks.proxy && chain.has(d.origin));
+    const ownConnectError = ownErrors.filter((d) => PRE_CONNECTION_ERRORS.has(d.code)).at(-1);
+    const ownUpstreamError = ownErrors.filter((d) => d.code === "upstream_error").at(-1);
 
-  private navigationError(s: BrowserSession, marks: Marks, err: unknown): ActionStop {
-    const message = err instanceof Error ? err.message : "";
-    const netError = message.match(/net::ERR_[A-Z0-9_]+/)?.[0];
-    const proxyError = s.proxy.events().filter((d) => d.kind === "error" && d.seq > marks.proxy).at(-1);
-    if (proxyError) {
-      const status: Status = proxyError.code === "connect_timeout" ? "timeout" : "provider_unavailable";
-      return new ActionStop(status, proxyError.code, "Navigation failed while connecting to the destination", netError ? { net_error: netError } : {});
-    }
-    const denied = this.newDenials(s, marks);
-    if (denied.length) {
-      const last = denied[denied.length - 1]!;
-      return new ActionStop("policy_denied", last.code, "Navigation was refused by policy", { blocked_requests: denied.slice(-20), ...(netError ? { net_error: netError } : {}) });
+    if (ownDenial) return new ActionStop("policy_denied", ownDenial.code, "Navigation was refused by policy", withNet);
+    if (netError && isTlsErrorToken(netError)) return new ActionStop("policy_denied", "tls_verification_failed", "TLS certificate verification failed", withNet);
+    if (ownConnectError) {
+      const status: Status = ownConnectError.code === "connect_timeout" ? "timeout" : "provider_unavailable";
+      return new ActionStop(status, ownConnectError.code, "Navigation failed while connecting to the destination", withNet);
     }
     if (err instanceof playwrightErrors.TimeoutError) return new ActionStop("timeout", "navigation_timeout", "Navigation timed out");
-    if (/ERR_CERT|ERR_SSL|SSL_PROTOCOL/i.test(message)) return new ActionStop("policy_denied", "tls_verification_failed", "TLS certificate verification failed", netError ? { net_error: netError } : {});
-    if (/ERR_ABORTED/.test(message)) return new ActionStop("blocked", "navigation_aborted", "Navigation was aborted (for example a download, which is refused)", netError ? { net_error: netError } : {});
-    if (netError) return new ActionStop("provider_unavailable", "navigation_failed", "Navigation failed", { net_error: netError });
+    if (netError === "net::ERR_ABORTED" || /Download is starting/.test(firstLine(err))) {
+      return new ActionStop("blocked", "navigation_aborted", "Navigation was aborted (for example a download, which is refused)", withNet);
+    }
+    if (ownUpstreamError) return new ActionStop("provider_unavailable", "upstream_error", "The connection to the destination failed during the response", withNet);
+    if (netError) return new ActionStop("provider_unavailable", "navigation_failed", "Navigation failed", withNet);
+    // No network error of its own: keep the earlier rule that a new denial explains it.
+    const anyDenial = this.newDenials(s, marks).at(-1);
+    if (anyDenial) return new ActionStop("policy_denied", anyDenial.code, "Navigation was refused by policy");
     return this.toStop(err);
   }
 

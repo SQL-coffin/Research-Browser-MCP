@@ -91,12 +91,12 @@ By default every URL the server outputs is shown as its **origin** only (e.g. `h
 - audit log lines on stderr;
 - `inspect_challenge` reports;
 - `pause_for_human` and `resume` outputs and the in-memory handoff records. Resume events are matched against an HMAC-SHA256 of the full canonical URL, never against the shown origin;
-- every URL in `browser.*` results (page URL, redirect chain, link targets, blocked requests) and the browser's handoffs;
+- every URL in `browser.*` results (page URL, redirect chain, link targets, blocked and failed requests) and the browser's handoffs;
 - evidence records.
 
 Results still carry `title`, `retrieved_at`, `content_hash` and `request_id`. The caller knows which URL it asked for, and `request_id` ties the result to that request.
 
-For hosts listed in `RESEARCH_BROWSER_FULL_URL_HOSTS`, `fetch_public_page` results show the full URL: path and query, without credentials or fragment, and with the values of query parameters whose names look secret-bearing (`token`, `key`, `sig`, `session`, …) masked. This is decided per URL by that URL's own host, so a redirect from an opted-in host to another host shows the other host's origin only. Browser results follow the same rule. Logs, challenge reports, handoff records and evidence records stay origin-only even for opted-in hosts.
+For hosts listed in `RESEARCH_BROWSER_FULL_URL_HOSTS`, `fetch_public_page` results show the full URL: path and query, without credentials or fragment, and with the values of query parameters whose names look secret-bearing (`token`, `key`, `sig`, `session`, …) masked. This is decided per URL by that URL's own host, so a redirect from an opted-in host to another host shows the other host's origin only. Browser results follow the same rule. Logs, `blocked_requests` and `failed_requests`, challenge reports, handoff records and evidence records stay origin-only even for opted-in hosts.
 
 > **No general-purpose program can reliably tell which path segments or parameter values are secrets.** Masking secret-looking parameter names is a heuristic. Listing a host in `RESEARCH_BROWSER_FULL_URL_HOSTS` means you knowingly accept that a token, session ID or other secret in that host's URLs may appear in results, and in anything that stores or forwards them.
 
@@ -207,7 +207,7 @@ The exact schema is to be finalized alongside acceptance tests. The initial cand
 - `research.pause_for_human` — persist a blocked task and provide a human handoff.
 - `research.resume` — continue only after a trusted human-feedback event is recorded by the integrating runtime.
 - `browser.open_session`, `browser.navigate`, `browser.snapshot`, `browser.click`, `browser.type`, `browser.scroll`, `browser.screenshot`, `browser.pause_for_human`, `browser.resume_session`, `browser.close_session` — the optional browser agent; see [Browser agent](docs/07-browser-agent.md).
-  Browser results include bounded `blocked_requests` and `failed_requests` diagnostics (up to 20 new entries per result), with origin-only URLs and sanitized Chromium network error codes. Proxy DNS/connection failures are logged as origin-only diagnostic events; no request paths, query strings, headers, cookies, bodies, or typed text are logged.
+  Every browser result includes `blocked_requests` and `failed_requests`: at most 20 new entries each, each reported once, with the warning `request_diagnostics_truncated` when entries were dropped, and both empty while a session is paused. A failed navigation may add a `net_error` token (`net::ERR_*`), and its error code comes from the navigation's own requests. The proxy records DNS, connection and upstream failures as origin-only events. Diagnostics and audit logs never contain paths, queries, headers, cookies, bodies or typed text. See [Browser agent, §4](docs/07-browser-agent.md#request-diagnostics).
 
 The server must not treat MCP itself as a security boundary. The client/runtime is responsible for registering tools only in allowed modes, controlling data scopes and egress, and enforcing its Policy Gate. The server must still independently validate requests and protect its network boundary.
 

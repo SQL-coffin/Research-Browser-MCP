@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
@@ -433,5 +433,659 @@ describe("egress proxy diagnostics", () => {
     assert.equal(event?.origin, `http://dnsfail.test:${port}`);
     assert.doesNotMatch(JSON.stringify(event), /private|token|secret/);
     assert.doesNotMatch(JSON.stringify(logs), /private|token|secret/);
+  });
+});
+
+// Diagnostics contract: event kinds and codes, denial header only on denials,
+// ring sizes and seq order, origin-only audit logs, upstream errors after a
+// connection was admitted (gap G4), and a policy regression matrix guarding
+// that diagnostics never change an allow/deny decision or status code.
+describe("egress proxy diagnostics contract", () => {
+  type Diagnostic = ReturnType<EgressProxy["events"]>[number];
+
+  const DENIAL = "x-research-browser-denial";
+  const EVENT_KEYS = ["at", "code", "kind", "origin", "seq"];
+  // Distinct markers per request part, so a leak names the part that leaked.
+  const SENTINELS = /PATHSENTINEL|QUERYSENTINEL|QVALSENTINEL|FRAGSENTINEL|COOKIESENTINEL|CVALSENTINEL|HEADERSENTINEL|BODYSENTINEL/;
+  const SECRET_TAIL = "/PATHSENTINEL_p1/deeper?QUERYSENTINEL_q2=QVALSENTINEL_v3#FRAGSENTINEL_f4";
+  const SECRET_HEADERS = { cookie: "COOKIESENTINEL_c5=CVALSENTINEL_c6", "x-diag-probe": "HEADERSENTINEL_h7", authorization: "Bearer HEADERSENTINEL_h8" };
+  const SECRET_BODY = "BODYSENTINEL_b9=1";
+
+  // Same resolver as the other tests, plus a name with an empty DNS answer.
+  const diagDeps = {
+    resolve: async (host: string): Promise<ResolvedAddress[]> => (host === "noanswer.test" ? [] : deps.resolve(host)),
+    log: deps.log,
+  };
+
+  let deadPort = 0; // nothing listens here
+  let appPort = 0; // HTTP fixture: complete, mid-body abort, reset before headers, hang, oversized
+  let resetPort = 0; // raw TCP: resets the connection on the first byte it receives
+  let echoPort = 0; // raw TCP: echoes the first chunk, then closes normally
+  let silentPort = 0; // raw TCP: accepts and never sends
+  let closeDelimitedPort = 0; // raw HTTP: response body delimited by connection close
+  let sendResetPort = 0; // raw TCP: sends bytes, then resets (a tunnel that already carried data)
+  let app: http.Server;
+  const rawServers: net.Server[] = [];
+  const rawSockets = new Set<net.Socket>();
+
+  async function listen(server: net.Server): Promise<number> {
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    return (server.address() as AddressInfo).port;
+  }
+
+  function rawServer(onSocket: (s: net.Socket) => void): Promise<number> {
+    const server = net.createServer((s) => {
+      rawSockets.add(s);
+      s.on("close", () => rawSockets.delete(s));
+      s.on("error", () => {});
+      onSocket(s);
+    });
+    rawServers.push(server);
+    return listen(server);
+  }
+
+  before(async () => {
+    const probe = net.createServer();
+    deadPort = await listen(probe);
+    await new Promise<void>((r) => probe.close(() => r()));
+
+    app = http.createServer((req, res) => {
+      const path = req.url ?? "";
+      if (path.startsWith("/midbody")) {
+        res.writeHead(200, { "content-type": "text/plain", "content-length": "100000" });
+        res.write("partial body");
+        setTimeout(() => req.socket.destroy(), 50);
+        return;
+      }
+      if (path.startsWith("/reset-before-headers")) {
+        req.socket.resetAndDestroy();
+        return;
+      }
+      if (path.startsWith("/hang")) return;
+      if (path.startsWith("/forged-proxy-error")) {
+        res.writeHead(200, { "content-type": "text/plain", "x-research-browser-proxy-error": "dns_resolution_failed" });
+        res.end("forged");
+        return;
+      }
+      if (path.startsWith("/big")) {
+        res.writeHead(200, { "content-type": "text/plain" });
+        res.end(Buffer.alloc(64 * 1024, 0x62));
+        return;
+      }
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("complete");
+    });
+    appPort = await listen(app);
+    resetPort = await rawServer((s) => s.once("data", () => s.resetAndDestroy()));
+    echoPort = await rawServer((s) => s.once("data", (d: Buffer) => s.end(d)));
+    silentPort = await rawServer(() => {});
+    closeDelimitedPort = await rawServer((s) => s.once("data", () => s.end("HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\r\nbody delimited by close")));
+    sendResetPort = await rawServer((s) =>
+      s.once("data", () => {
+        s.write("server-bytes");
+        setTimeout(() => s.resetAndDestroy(), 50);
+      }),
+    );
+  });
+  after(() => {
+    app.closeAllConnections();
+    app.close();
+    for (const s of rawSockets) s.destroy();
+    for (const s of rawServers) s.close();
+  });
+
+  function diagPolicy(overrides: Partial<EgressPolicy> = {}): EgressPolicy {
+    return policy({
+      allowedHosts: parseHostAllowlist("fixture.test private.test mixed.test dnsfail.test noanswer.test"),
+      allowedPorts: new Set([port, deadPort, appPort, resetPort, echoPort, silentPort, closeDelimitedPort, sendResetPort]),
+      ...overrides,
+    });
+  }
+
+  async function startDiag(p = diagPolicy()): Promise<EgressProxy> {
+    const proxy = await startEgressProxy(p, diagDeps);
+    proxies.push(proxy);
+    return proxy;
+  }
+
+  function connectWith(proxy: EgressProxy, target: string, headers: http.OutgoingHttpHeaders): Promise<{ status: number; headers: http.IncomingHttpHeaders; socket: net.Socket }> {
+    return new Promise((resolve, reject) => {
+      const req = http.request({ host: "127.0.0.1", port: proxy.port, method: "CONNECT", path: target, headers: { "proxy-authorization": auth(proxy), ...headers } });
+      req.on("connect", (res, socket) => resolve({ status: res.statusCode ?? 0, headers: res.headers, socket }));
+      req.on("error", reject);
+      req.end();
+    });
+  }
+
+  /** An established tunnel whose received bytes are collected (keeps the socket flowing so 'close' fires). */
+  async function tunnel(proxy: EgressProxy, target: string): Promise<{ status: number; socket: net.Socket; received: () => string }> {
+    const t = await connect(proxy, target);
+    let data = "";
+    t.socket.on("error", () => {});
+    t.socket.on("data", (d: Buffer) => (data += d.toString()));
+    return { status: t.status, socket: t.socket, received: () => data };
+  }
+
+  function closed(socket: net.Socket, ms = 3_000): Promise<boolean> {
+    return new Promise((resolve) => {
+      if (socket.closed) return resolve(true);
+      const timer = setTimeout(() => resolve(false), ms);
+      socket.once("close", () => {
+        clearTimeout(timer);
+        resolve(true);
+      });
+    });
+  }
+
+  async function waitFor(cond: () => boolean, ms = 1_500): Promise<boolean> {
+    const end = Date.now() + ms;
+    while (!cond()) {
+      if (Date.now() > end) return false;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    return true;
+  }
+
+  const settle = (ms = 200) => new Promise((r) => setTimeout(r, ms));
+
+  function assertEvent(event: Diagnostic | undefined, kind: "error" | "deny", code: string, origin: string, label = code): void {
+    assert.ok(event, `${label}: expected a ${kind} event`);
+    assert.deepEqual(Object.keys(event).sort(), EVENT_KEYS, `${label}: origin-only event shape`);
+    assert.equal(event.kind, kind, label);
+    assert.equal(event.code, code, label);
+    assert.equal(event.origin, origin, label);
+  }
+
+  // Failures before any byte reaches a destination: reply 502, kind "error".
+  const errorCases = () => [
+    { authority: `dnsfail.test:${port}`, code: "dns_resolution_failed" },
+    { authority: `noanswer.test:${port}`, code: "dns_no_answer" },
+    { authority: `fixture.test:${deadPort}`, code: "connection_failed" },
+  ];
+
+  // ---- P1: kind "error" events, origin-only, status unchanged -------------
+
+  it("P1: DNS and connection failures on plain HTTP are origin-only error events; status stays 502", async () => {
+    const proxy = await startDiag();
+    for (const c of errorCases()) {
+      const r = await viaProxy(proxy, `http://${c.authority}${SECRET_TAIL}`);
+      assert.equal(r.status, 502, c.code);
+      assertEvent(proxy.events().at(-1), "error", c.code, `http://${c.authority}`);
+    }
+    assert.equal(proxy.events().length, 3, JSON.stringify(proxy.events()));
+    assert.deepEqual(proxy.denials(), [], "errors are not denials");
+    assert.doesNotMatch(JSON.stringify(proxy.events()), SENTINELS);
+  });
+
+  it("P1: DNS and connection failures on CONNECT are origin-only error events; reply stays 502", async () => {
+    const proxy = await startDiag();
+    for (const c of errorCases()) {
+      const t = await connect(proxy, c.authority);
+      t.socket.destroy();
+      assert.equal(t.status, 502, c.code);
+      assertEvent(proxy.events().at(-1), "error", c.code, `https://${c.authority}`);
+    }
+    assert.equal(proxy.events().length, 3, JSON.stringify(proxy.events()));
+    assert.deepEqual(proxy.denials(), [], "errors are not denials");
+  });
+
+  describe("P1: connect timeout (listener whose accept queue is full)", { skip: process.platform === "win32" && "needs a POSIX listen backlog and SIGSTOP" }, () => {
+    // A child process listens with backlog 1 and stops itself, so it never accepts.
+    // Once the queue is full the kernel drops further SYNs and connects hang.
+    const STALLED_LISTENER =
+      'const s = require("node:net").createServer(); s.listen({ port: 0, host: "127.0.0.1", backlog: 1 }, () => process.stdout.write(s.address().port + "\\n", () => process.kill(process.pid, "SIGSTOP")));';
+    let child: ChildProcess | undefined;
+    let stalledPort = 0;
+    let ready = false;
+    const fillers: net.Socket[] = [];
+
+    before(async () => {
+      child = spawn(process.execPath, ["-e", STALLED_LISTENER], { stdio: ["ignore", "pipe", "ignore"] });
+      const c = child;
+      stalledPort = await new Promise<number>((resolve, reject) => {
+        c.stdout!.once("data", (d: Buffer) => resolve(Number(String(d).trim())));
+        c.once("error", reject);
+        c.once("exit", () => reject(new Error("stalled listener exited early")));
+      });
+      for (let i = 0; i < 16; i++) {
+        const s = net.connect({ host: "127.0.0.1", port: stalledPort });
+        fillers.push(s);
+        const state = await new Promise<"connected" | "pending" | "failed">((resolve) => {
+          const timer = setTimeout(() => resolve("pending"), 250);
+          s.once("connect", () => {
+            clearTimeout(timer);
+            resolve("connected");
+          });
+          s.once("error", () => {
+            clearTimeout(timer);
+            resolve("failed");
+          });
+        });
+        s.on("error", () => {});
+        if (state === "failed") break;
+        if (state === "pending") {
+          ready = true;
+          break;
+        }
+      }
+    });
+    after(() => {
+      for (const s of fillers) s.destroy();
+      child?.stdout?.destroy();
+      child?.kill("SIGKILL");
+    });
+
+    it("plain HTTP: connect_timeout is an origin-only error event; status stays 504, no denial header", async (t) => {
+      if (!ready) return t.skip("the kernel did not hold back connections to a full accept queue");
+      const proxy = await startDiag(diagPolicy({ allowedPorts: new Set([stalledPort]), connectTimeoutMs: 300 }));
+      const r = await viaProxy(proxy, `http://fixture.test:${stalledPort}${SECRET_TAIL}`);
+      assert.equal(r.status, 504);
+      assert.equal(r.headers[DENIAL], undefined);
+      assertEvent(proxy.events().at(-1), "error", "connect_timeout", `http://fixture.test:${stalledPort}`);
+      assert.deepEqual(proxy.denials(), []);
+    });
+
+    it("CONNECT: connect_timeout is an origin-only error event; reply stays 504, no denial header", async (t) => {
+      if (!ready) return t.skip("the kernel did not hold back connections to a full accept queue");
+      const proxy = await startDiag(diagPolicy({ allowedPorts: new Set([stalledPort]), connectTimeoutMs: 300 }));
+      const tn = await connect(proxy, `fixture.test:${stalledPort}`);
+      tn.socket.destroy();
+      assert.equal(tn.status, 504);
+      assert.equal(tn.headers[DENIAL], undefined);
+      assertEvent(proxy.events().at(-1), "error", "connect_timeout", `https://fixture.test:${stalledPort}`);
+      assert.deepEqual(proxy.denials(), []);
+    });
+  });
+
+  // ---- P2: denial header only on denials -----------------------------------
+
+  it("P2: plain-HTTP error responses carry no denial header; policy denials still do", async () => {
+    const proxy = await startDiag();
+    for (const c of errorCases()) {
+      const r = await viaProxy(proxy, `http://${c.authority}/`);
+      assert.equal(r.status, 502, c.code);
+      assert.equal(r.headers[DENIAL], undefined, c.code);
+    }
+    const denials = [
+      { target: `http://unlisted.test:${port}/`, code: "host_not_allowlisted" },
+      { target: `http://private.test:${port}/`, code: "address_private" },
+      { target: `http://fixture.test:${port}/form`, code: "method_not_allowed", method: "POST" },
+      { target: "http://fixture.test:22/", code: "port_not_allowed" },
+    ];
+    for (const d of denials) {
+      const r = await viaProxy(proxy, d.target, d.method ? { method: d.method, body: "a=1" } : {});
+      assert.equal(r.status, 403, d.code);
+      assert.equal(r.headers[DENIAL], d.code, d.code);
+      const origin = new URL(d.target).origin;
+      assertEvent(proxy.denials().at(-1), "deny", d.code, origin);
+      assertEvent(proxy.events().at(-1), "deny", d.code, origin);
+    }
+    assert.deepEqual(hits, [], "no denied request reached the origin");
+  });
+
+  it("P2: CONNECT error replies carry no denial header; policy denials still do", async () => {
+    const proxy = await startDiag();
+    for (const c of errorCases()) {
+      const t = await connect(proxy, c.authority);
+      t.socket.destroy();
+      assert.equal(t.status, 502, c.code);
+      assert.equal(t.headers[DENIAL], undefined, c.code);
+    }
+    const denials = [
+      { target: `unlisted.test:${port}`, code: "host_not_allowlisted" },
+      { target: `private.test:${port}`, code: "address_private" },
+      { target: "fixture.test:22", code: "port_not_allowed" },
+    ];
+    for (const d of denials) {
+      const t = await connect(proxy, d.target);
+      t.socket.destroy();
+      assert.equal(t.status, 403, d.code);
+      assert.equal(t.headers[DENIAL], d.code, d.code);
+      assertEvent(proxy.denials().at(-1), "deny", d.code, `https://${d.target}`);
+    }
+  });
+
+  // ---- P3: denials() vs events(), seq order, ring size ---------------------
+
+  it("P3: denials() holds only denials; events() holds both in strictly increasing seq order, at most 50 of each kind", async () => {
+    const proxy = await startDiag();
+    for (let i = 0; i < 30; i++) {
+      await viaProxy(proxy, `http://unlisted.test:${port}/`); // deny
+      await viaProxy(proxy, `http://dnsfail.test:${port}/`); // error
+    }
+    const events = proxy.events();
+    assert.equal(events.length, 60, "30 of each kind fit in their own 50-entry buffers");
+    assert.deepEqual(new Set(events.map((e) => e.kind)), new Set(["deny", "error"]));
+    for (let i = 1; i < events.length; i++) assert.ok(events[i]!.seq > events[i - 1]!.seq, `seq not increasing at ${i}`);
+    assert.equal(events.at(-1)?.seq, 60, "seq counts every event over the proxy's lifetime");
+    assert.equal(events[0]?.seq, 1);
+
+    const denials = proxy.denials();
+    assert.ok(denials.length > 0 && denials.length <= 50, `denials().length = ${denials.length}`);
+    assert.ok(
+      denials.every((d) => d.kind === "deny" && d.code === "host_not_allowlisted"),
+      "denials() holds only kind deny",
+    );
+    for (let i = 1; i < denials.length; i++) assert.ok(denials[i]!.seq > denials[i - 1]!.seq, `denial seq not increasing at ${i}`);
+    assert.equal(denials.at(-1)?.seq, 59, "the newest denial is last");
+  });
+
+  it("P3: neither list exceeds 50 after more than 50 denials", async () => {
+    const proxy = await startDiag();
+    for (let i = 0; i < 55; i++) await viaProxy(proxy, `http://unlisted.test:${port}/`);
+    await viaProxy(proxy, `http://dnsfail.test:${port}/`);
+    const denials = proxy.denials();
+    assert.ok(denials.length > 0 && denials.length <= 50, `denials().length = ${denials.length}`);
+    assert.ok(denials.every((d) => d.kind === "deny"));
+    assert.equal(denials.at(-1)?.seq, 55);
+    assert.equal(denials.length, 50, "the newest 50 denials are kept");
+    assert.equal(denials[0]?.seq, 6);
+    const events = proxy.events();
+    assert.equal(events.length, 51, "50 denials plus the one error");
+    assert.equal(events.at(-1)?.kind, "error");
+    assert.equal(events.at(-1)?.seq, 56);
+  });
+
+  it("F6: error noise never pushes a denial out (denials and errors are buffered separately)", async () => {
+    const proxy = await startDiag();
+    await viaProxy(proxy, `http://private.test:${port}/`); // deny: address_private
+    for (let i = 0; i < 60; i++) await viaProxy(proxy, `http://dnsfail.test:${port}/`); // errors
+    assert.deepEqual(
+      proxy.denials().map((d) => [d.seq, d.code]),
+      [[1, "address_private"]],
+    );
+    const events = proxy.events();
+    assert.equal(events.filter((e) => e.kind === "error").length, 50);
+    assert.equal(events[0]?.code, "address_private");
+    for (let i = 1; i < events.length; i++) assert.ok(events[i]!.seq > events[i - 1]!.seq, `seq not increasing at ${i}`);
+  });
+
+  it("F1: proxy-generated plain-HTTP error replies name their code in x-research-browser-proxy-error; denials and destination replies never do", async () => {
+    const PROXY_ERROR = "x-research-browser-proxy-error";
+    const proxy = await startDiag();
+    for (const c of errorCases()) {
+      const r = await viaProxy(proxy, `http://${c.authority}/`);
+      assert.equal(r.status, 502, c.code);
+      assert.equal(r.headers[PROXY_ERROR], c.code, c.code);
+      assert.equal(r.headers[DENIAL], undefined, c.code);
+    }
+    const reset = await viaProxy(proxy, `http://fixture.test:${appPort}/reset-before-headers`);
+    assert.equal(reset.status, 502);
+    assert.equal(reset.headers[PROXY_ERROR], "upstream_error");
+    const denied = await viaProxy(proxy, `http://unlisted.test:${port}/`);
+    assert.equal(denied.status, 403);
+    assert.equal(denied.headers[PROXY_ERROR], undefined);
+    const forged = await viaProxy(proxy, `http://fixture.test:${appPort}/forged-proxy-error`);
+    assert.equal(forged.status, 200);
+    assert.equal(forged.headers[PROXY_ERROR], undefined, "a destination cannot claim to be the proxy");
+  });
+
+  it("F1: a tunnel whose destination already sent data and then resets records no upstream_error (indistinguishable from a normal close)", async () => {
+    const proxy = await startDiag();
+    const t = await tunnel(proxy, `fixture.test:${sendResetPort}`);
+    assert.equal(t.status, 200);
+    const gone = closed(t.socket);
+    t.socket.write("hello");
+    assert.ok(await gone, "the proxy closes the client side");
+    await settle();
+    assert.match(t.received(), /server-bytes/);
+    assert.ok(!proxy.events().some((e) => e.code === "upstream_error"), JSON.stringify(proxy.events()));
+  });
+
+  it("F12: allow lines name the connection type as transport; kind only ever means deny or error", async () => {
+    const proxy = await startDiag();
+    logs.length = 0;
+    await viaProxy(proxy, `http://fixture.test:${port}/`);
+    await viaProxy(proxy, `http://unlisted.test:${port}/`);
+    await viaProxy(proxy, `http://dnsfail.test:${port}/`);
+    const egress = logs.filter((l) => l.event === "egress");
+    const allow = egress.find((l) => l.decision === "allow");
+    assert.equal(allow?.transport, "http", JSON.stringify(allow));
+    assert.equal(allow && "kind" in allow, false, JSON.stringify(allow));
+    for (const l of egress.filter((x) => x.decision !== "allow")) assert.equal(l.kind, l.decision, JSON.stringify(l));
+  });
+
+  // ---- P4: audit log lines are origin + code only --------------------------
+
+  it("P4: plain-HTTP audit log lines name origin and code but no path, query, fragment, header, cookie or body", async () => {
+    const proxy = await startDiag();
+    const cases = [
+      ...errorCases(),
+      { authority: `unlisted.test:${port}`, code: "host_not_allowlisted" },
+      { authority: `private.test:${port}`, code: "address_private" },
+      { authority: "fixture.test:22", code: "port_not_allowed" },
+      { authority: `fixture.test:${port}`, code: "method_not_allowed", method: "POST" },
+    ];
+    for (const c of cases) {
+      logs.length = 0;
+      const opts = "method" in c ? { method: c.method, headers: SECRET_HEADERS, body: SECRET_BODY } : { headers: SECRET_HEADERS };
+      await viaProxy(proxy, `http://${c.authority}${SECRET_TAIL}`, opts);
+      const origin = `http://${c.authority}`;
+      assert.ok(
+        logs.some((l) => l.origin === origin && l.code === c.code),
+        `${c.code}: no log line with origin and code: ${JSON.stringify(logs)}`,
+      );
+      assert.doesNotMatch(JSON.stringify(logs), SENTINELS, c.code);
+    }
+    logs.length = 0;
+    const ok = await viaProxy(proxy, `http://fixture.test:${port}${SECRET_TAIL}`, { headers: SECRET_HEADERS });
+    assert.equal(ok.status, 200);
+    assert.ok(logs.some((l) => l.origin === `http://fixture.test:${port}`));
+    assert.doesNotMatch(JSON.stringify(logs), SENTINELS, "allowed request");
+    assert.doesNotMatch(JSON.stringify(proxy.events()), SENTINELS);
+  });
+
+  it("P4: CONNECT audit log lines name origin and code but no header or cookie", async () => {
+    const proxy = await startDiag();
+    const cases = [
+      ...errorCases(),
+      { authority: `unlisted.test:${port}`, code: "host_not_allowlisted" },
+      { authority: `private.test:${port}`, code: "address_private" },
+      { authority: "fixture.test:22", code: "port_not_allowed" },
+    ];
+    for (const c of cases) {
+      logs.length = 0;
+      const t = await connectWith(proxy, c.authority, SECRET_HEADERS);
+      t.socket.destroy();
+      const origin = `https://${c.authority}`;
+      assert.ok(
+        logs.some((l) => l.origin === origin && l.code === c.code),
+        `${c.code}: no log line with origin and code: ${JSON.stringify(logs)}`,
+      );
+      assert.doesNotMatch(JSON.stringify(logs), SENTINELS, c.code);
+    }
+    assert.doesNotMatch(JSON.stringify(proxy.events()), SENTINELS);
+  });
+
+  // ---- P5: upstream errors after admission (gap G4) ------------------------
+
+  async function upstreamErrors(proxy: EgressProxy): Promise<Diagnostic[]> {
+    await waitFor(() => proxy.events().some((e) => e.code === "upstream_error"));
+    await settle(100); // catch a duplicate recorded for the same failure
+    return proxy.events().filter((e) => e.code === "upstream_error");
+  }
+
+  it("[gap G4] P5a: an upstream that drops the connection mid-body is one upstream_error event (plain HTTP), status unchanged", async () => {
+    const proxy = await startDiag();
+    const r = await viaProxy(proxy, `http://fixture.test:${appPort}/midbody${SECRET_TAIL}`, { headers: SECRET_HEADERS });
+    assert.equal(r.status, 200, "headers were already relayed, so the status stays 200");
+    assert.ok(r.error, "the client sees a truncated response");
+    const errors = await upstreamErrors(proxy);
+    assert.equal(errors.length, 1, `events: ${JSON.stringify(proxy.events())}`);
+    assertEvent(errors[0], "error", "upstream_error", `http://fixture.test:${appPort}`);
+    assert.deepEqual(proxy.denials(), [], "an upstream error is not a denial");
+    assert.ok(logs.some((l) => l.origin === `http://fixture.test:${appPort}` && l.code === "upstream_error"), JSON.stringify(logs));
+    assert.doesNotMatch(JSON.stringify(logs), SENTINELS);
+    assert.doesNotMatch(JSON.stringify(proxy.events()), SENTINELS);
+  });
+
+  it("[gap G4] P5a: an upstream reset before the response headers is one upstream_error event (plain HTTP), status stays 502", async () => {
+    const proxy = await startDiag();
+    const r = await viaProxy(proxy, `http://fixture.test:${appPort}/reset-before-headers${SECRET_TAIL}`, { headers: SECRET_HEADERS });
+    assert.equal(r.status, 502);
+    assert.equal(r.headers[DENIAL], undefined, "an upstream error is not a denial");
+    const errors = await upstreamErrors(proxy);
+    assert.equal(errors.length, 1, `events: ${JSON.stringify(proxy.events())}`);
+    assertEvent(errors[0], "error", "upstream_error", `http://fixture.test:${appPort}`);
+    assert.deepEqual(proxy.denials(), []);
+    assert.ok(logs.some((l) => l.origin === `http://fixture.test:${appPort}` && l.code === "upstream_error"), JSON.stringify(logs));
+    assert.doesNotMatch(JSON.stringify(logs), SENTINELS);
+  });
+
+  it("[gap G4] P5b: an upstream reset inside a CONNECT tunnel is one upstream_error event", async () => {
+    const proxy = await startDiag();
+    const t = await tunnel(proxy, `fixture.test:${resetPort}`);
+    assert.equal(t.status, 200);
+    const gone = closed(t.socket);
+    t.socket.write("hello");
+    assert.ok(await gone, "the proxy closes the client side of a reset tunnel");
+    const errors = await upstreamErrors(proxy);
+    assert.equal(errors.length, 1, `events: ${JSON.stringify(proxy.events())}`);
+    assertEvent(errors[0], "error", "upstream_error", `https://fixture.test:${resetPort}`);
+    assert.deepEqual(proxy.denials(), []);
+    assert.ok(logs.some((l) => l.origin === `https://fixture.test:${resetPort}` && l.code === "upstream_error"), JSON.stringify(logs));
+  });
+
+  it("P5: completed plain-HTTP responses record no event (content-length and close-delimited bodies)", async () => {
+    const proxy = await startDiag();
+    const a = await viaProxy(proxy, `http://fixture.test:${appPort}/ok`);
+    assert.equal(a.status, 200);
+    assert.equal(a.body, "complete");
+    assert.equal(a.error, undefined);
+    const b = await viaProxy(proxy, `http://fixture.test:${closeDelimitedPort}/`);
+    assert.equal(b.status, 200);
+    assert.equal(b.body, "body delimited by close");
+    const c = await viaProxy(proxy, `http://fixture.test:${port}/`);
+    assert.equal(c.status, 200);
+    await settle();
+    assert.deepEqual(proxy.events(), []);
+  });
+
+  it("P5: tunnels closed normally by either side record no event", async () => {
+    const proxy = await startDiag();
+    const echo = await tunnel(proxy, `fixture.test:${echoPort}`);
+    assert.equal(echo.status, 200);
+    echo.socket.write("ping");
+    assert.ok(await closed(echo.socket), "the upstream closed the tunnel");
+    assert.equal(echo.received(), "ping");
+
+    const ended = await tunnel(proxy, `fixture.test:${silentPort}`);
+    assert.equal(ended.status, 200);
+    ended.socket.end();
+    assert.ok(await closed(ended.socket), "a client half-close ends the tunnel");
+
+    const aborted = await tunnel(proxy, `fixture.test:${silentPort}`);
+    assert.equal(aborted.status, 200);
+    aborted.socket.destroy();
+
+    await settle();
+    assert.deepEqual(proxy.events(), []);
+  });
+
+  it("P5: idle-timeout closes record no event (tunnel closed; plain HTTP stays 502)", async () => {
+    const proxy = await startDiag(diagPolicy({ idleTimeoutMs: 150 }));
+    const t = await tunnel(proxy, `fixture.test:${silentPort}`);
+    assert.equal(t.status, 200);
+    assert.ok(await closed(t.socket), "the idle tunnel is closed by the proxy");
+    const r = await viaProxy(proxy, `http://fixture.test:${appPort}/hang`);
+    assert.equal(r.status, 502);
+    assert.equal(r.headers[DENIAL], undefined);
+    await settle();
+    assert.deepEqual(proxy.events(), []);
+  });
+
+  it("P5: a response cut off by the byte limit is only a response_too_large denial, not an upstream_error", async () => {
+    const proxy = await startDiag(diagPolicy({ maxResponseBytes: 1024 }));
+    const r = await viaProxy(proxy, `http://fixture.test:${appPort}/big`);
+    assert.ok(r.body.length < 64 * 1024);
+    await settle();
+    assert.deepEqual(
+      proxy.events().map((e) => [e.kind, e.code, e.origin]),
+      [["deny", "response_too_large", `http://fixture.test:${appPort}`]],
+    );
+  });
+
+  it("P5: connections the proxy closes itself (session byte budget, shutdown) record no upstream_error", async () => {
+    const budget = await startDiag(diagPolicy({ maxSessionBytes: 2_000 }));
+    const r = await viaProxy(budget, `http://fixture.test:${appPort}/big`);
+    assert.ok(r.body.length < 64 * 1024);
+    await settle();
+    assert.ok(!budget.events().some((e) => e.code === "upstream_error"), JSON.stringify(budget.events()));
+
+    const closing = await startDiag();
+    const pending = viaProxy(closing, `http://fixture.test:${appPort}/big`);
+    await closing.close();
+    await pending;
+    await settle();
+    assert.ok(!closing.events().some((e) => e.code === "upstream_error"), JSON.stringify(closing.events()));
+  });
+
+  // ---- P6: policy regression matrix ----------------------------------------
+
+  it("P6: plain-HTTP allow/deny decisions and statuses are unchanged", async () => {
+    const proxy = await startDiag();
+    const rows: { target: string; method?: string; status: number; denial?: string }[] = [
+      { target: `http://fixture.test:${port}/m-get`, status: 200 },
+      { target: `http://fixture.test:${port}/m-head`, method: "HEAD", status: 200 },
+      { target: `http://unlisted.test:${port}/m`, status: 403, denial: "host_not_allowlisted" },
+      { target: `http://private.test:${port}/m`, status: 403, denial: "address_private" },
+      { target: `http://mixed.test:${port}/m`, status: 403, denial: "address_private" },
+      { target: `http://10.0.0.1:${port}/m`, status: 403, denial: "address_private" },
+      { target: `http://127.0.0.1:${port}/m`, status: 403, denial: "host_not_allowlisted" },
+      { target: `http://[::1]:${port}/m`, status: 403, denial: "address_loopback" },
+      { target: `http://localhost:${port}/m`, status: 403, denial: "host_not_public" },
+      { target: `http://printer.local:${port}/m`, status: 403, denial: "host_not_public" },
+      { target: `http://user:pw@fixture.test:${port}/m`, status: 403, denial: "url_credentials" },
+      { target: "http://fixture.test:22/m", status: 403, denial: "port_not_allowed" },
+      { target: "http://169.254.169.254/latest/meta-data/", status: 403, denial: "port_not_allowed" },
+      { target: `http://fixture.test:${port}/m-post`, method: "POST", status: 403, denial: "method_not_allowed" },
+      { target: `https://fixture.test:${port}/m`, status: 400 },
+    ];
+    const reached: string[] = [];
+    for (const row of rows) {
+      const seqBefore = proxy.events().at(-1)?.seq ?? 0;
+      const r = await viaProxy(proxy, row.target, row.method === "POST" ? { method: row.method, body: "a=1" } : row.method ? { method: row.method } : {});
+      assert.equal(r.status, row.status, row.target);
+      assert.equal(r.headers[DENIAL], row.denial, row.target);
+      const fresh = proxy.events().filter((e) => e.seq > seqBefore);
+      assert.deepEqual(
+        fresh.map((e) => [e.kind, e.code]),
+        row.denial ? [["deny", row.denial]] : [],
+        row.target,
+      );
+      if (row.status === 200) reached.push(new URL(row.target).pathname);
+    }
+    assert.deepEqual(hits, reached, "only allowed requests reached the origin");
+  });
+
+  it("P6: CONNECT allow/deny decisions and statuses are unchanged", async () => {
+    const proxy = await startDiag();
+    const rows: { target: string; status: number; denial?: string }[] = [
+      { target: `fixture.test:${port}`, status: 200 },
+      { target: `unlisted.test:${port}`, status: 403, denial: "host_not_allowlisted" },
+      { target: `private.test:${port}`, status: 403, denial: "address_private" },
+      { target: `mixed.test:${port}`, status: 403, denial: "address_private" },
+      { target: `10.0.0.1:${port}`, status: 403, denial: "address_private" },
+      { target: `127.0.0.1:${port}`, status: 403, denial: "host_not_allowlisted" },
+      { target: `[::1]:${port}`, status: 403, denial: "address_loopback" },
+      { target: `localhost:${port}`, status: 403, denial: "host_not_public" },
+      { target: `user:pw@fixture.test:${port}`, status: 400 },
+      { target: "fixture.test:22", status: 403, denial: "port_not_allowed" },
+      { target: "169.254.169.254:443", status: 403, denial: "port_not_allowed" },
+    ];
+    for (const row of rows) {
+      const seqBefore = proxy.events().at(-1)?.seq ?? 0;
+      const t = await connect(proxy, row.target);
+      t.socket.destroy();
+      assert.equal(t.status, row.status, row.target);
+      assert.equal(t.headers[DENIAL], row.denial, row.target);
+      const fresh = proxy.events().filter((e) => e.seq > seqBefore);
+      assert.deepEqual(
+        fresh.map((e) => [e.kind, e.code]),
+        row.denial ? [["deny", row.denial]] : [],
+        row.target,
+      );
+    }
+    assert.deepEqual(hits, [], "a tunnel alone sends no request to the origin");
   });
 });

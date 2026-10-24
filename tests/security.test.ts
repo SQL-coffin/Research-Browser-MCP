@@ -337,6 +337,17 @@ describe("URL disclosure in fetch results (output only)", () => {
 });
 
 describe("redaction (RB-09)", () => {
+  it("bounds the origin: a host name longer than DNS allows is replaced, in every mode", () => {
+    const longHost = `${"a".repeat(63)}.${"b".repeat(63)}.${"c".repeat(63)}.${"d".repeat(63)}.evil`; // 260 characters
+    for (const mode of ["origin", "display"] as const) {
+      const out = redactUrl(`https://${longHost}/p?q=1`, mode);
+      assert.equal(out, "[invalid-host]", mode);
+    }
+    assert.equal(discloseUrl(`https://${longHost}/`, ORIGIN_ONLY), "[invalid-host]");
+    const maxHost = `${"a".repeat(63)}.${"b".repeat(63)}.${"c".repeat(63)}.${"d".repeat(57)}.org`; // 253 characters
+    assert.equal(redactUrl(`https://${maxHost}/x`, "origin"), `https://${maxHost}`);
+  });
+
   it("drops userinfo and fragments and masks secret-looking params for display", () => {
     const out = redactUrl("https://u:p@example.org/x?q=cats&api_key=abc123&token=zzz#frag");
     assert.equal(out, "https://example.org/x?q=cats&api_key=REDACTED&token=REDACTED");

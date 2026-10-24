@@ -112,8 +112,12 @@ export class BrowserSession {
   pause: SessionPause | null = null;
   /** Requests the context refused before they reached the proxy, newest last (origins only). */
   readonly blockedRequests: { seq: number; origin: string; code: string }[] = [];
-  /** Failed requests, with URLs reduced to origin and errors reduced to network error codes. */
-  readonly failedRequests: { seq: number; origin: string; resource_type: string; status?: number; error_text?: string }[] = [];
+  /**
+   * Failed requests, with URLs reduced to origin and errors reduced to network error
+   * codes. `main_frame` is internal (it marks the main frame's own navigation
+   * requests, used to explain a failed navigation) and is never returned or logged.
+   */
+  readonly failedRequests: { seq: number; origin: string; resource_type: string; status?: number; error_text?: string; main_frame: boolean }[] = [];
   lastReportedBlockedContextSeq = 0;
   lastReportedBlockedProxySeq = 0;
   lastReportedFailedSeq = 0;
@@ -178,13 +182,17 @@ export class BrowserSession {
     const { context, page } = this;
     // Second check inside the browser: same URL policy and allowlist, plus the
     // method rule, which the proxy cannot see inside an HTTPS tunnel.
+    // The decision is a pure function of the URL, the method and the configuration,
+    // so the failure listener below can recognise the requests it aborted.
+    const refusal = (raw: string, method: string): string | null => {
+      const check = validateUrl(raw, config.egress);
+      if (!check.ok) return check.code;
+      if (!config.egress.allowedMethods.has(method.toUpperCase()) && !isUrlHostListed(check.url, config.egress.formSubmitHosts)) return "method_not_allowed";
+      return null;
+    };
     await context.route("**/*", async (route, request) => {
       const raw = request.url();
-      const check = validateUrl(raw, config.egress);
-      let code: string | null = check.ok ? null : check.code;
-      if (check.ok && !config.egress.allowedMethods.has(request.method().toUpperCase()) && !isUrlHostListed(check.url, config.egress.formSubmitHosts)) {
-        code = "method_not_allowed";
-      }
+      const code = refusal(raw, request.method());
       if (code) {
         this.recordBlocked(redactUrl(raw, "origin"), code);
         await route.abort("blockedbyclient").catch(() => {});
@@ -214,7 +222,19 @@ export class BrowserSession {
       const rawError = request.failure()?.errorText ?? "request_failed";
       // Playwright error text can include a URL on some versions; retain only a Chromium error token.
       const errorText = rawError.match(/net::ERR_[A-Z0-9_]+/)?.[0] ?? "request_failed";
-      this.recordFailed(redactUrl(request.url(), "origin"), request.resourceType(), undefined, errorText);
+      const raw = request.url();
+      // Aborted by the check above, so already reported as blocked: not also a failure.
+      // (Matched by recomputing the decision, not by Request identity: in an
+      // instrumented run under a heavy request flood, this listener often got a
+      // different Request object than the route had seen for the same URL.)
+      if (errorText === "net::ERR_BLOCKED_BY_CLIENT" && refusal(raw, request.method()) !== null) return;
+      let mainFrame = false;
+      try {
+        mainFrame = request.isNavigationRequest() && request.frame() === page.mainFrame();
+      } catch {
+        // Requests without a frame (e.g. from a worker) are not navigations.
+      }
+      this.recordFailed(redactUrl(raw, "origin"), request.resourceType(), undefined, errorText, mainFrame);
     });
     page.on("response", (res) => {
       const request = res.request();
@@ -243,8 +263,8 @@ export class BrowserSession {
     this.deps.log({ event: "browser_request_blocked", session_id: this.id, origin, code });
   }
 
-  recordFailed(origin: string, resourceType: string, status?: number, errorText?: string): void {
-    this.failedRequests.push({ seq: ++this.failedSeq, origin, resource_type: resourceType, ...(status === undefined ? {} : { status }), ...(errorText ? { error_text: errorText } : {}) });
+  recordFailed(origin: string, resourceType: string, status?: number, errorText?: string, mainFrame = false): void {
+    this.failedRequests.push({ seq: ++this.failedSeq, origin, resource_type: resourceType, ...(status === undefined ? {} : { status }), ...(errorText ? { error_text: errorText } : {}), main_frame: mainFrame });
     if (this.failedRequests.length > 50) this.failedRequests.shift();
     this.deps.log({ event: "browser_request_failed", session_id: this.id, origin, resource_type: resourceType, ...(status === undefined ? {} : { status }), ...(errorText ? { error_text: errorText } : {}) });
   }
