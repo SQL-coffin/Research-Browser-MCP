@@ -435,3 +435,101 @@ describe("egress proxy diagnostics", () => {
     assert.doesNotMatch(JSON.stringify(logs), /private|token|secret/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Contract: docs/08-browser-diagnostics-contract.md (D1, D2). These tests are
+// written before the implementation and fail until it lands.
+// ---------------------------------------------------------------------------
+
+function resolverError(code: string, message: string): NodeJS.ErrnoException {
+  const err = new Error(message) as NodeJS.ErrnoException;
+  err.code = code;
+  return err;
+}
+
+describe("egress proxy diagnostics contract: DNS timeout (D1)", () => {
+  it("bounds name resolution by connectTimeoutMs and records dns_timeout", { timeout: 5_000 }, async () => {
+    const proxy = await startEgressProxy(policy({ allowedHosts: parseHostAllowlist("hang.test"), connectTimeoutMs: 300 }), {
+      ...deps,
+      resolve: () => new Promise<ResolvedAddress[]>(() => {}),
+    });
+    proxies.push(proxy);
+    const started = Date.now();
+    const r = await viaProxy(proxy, `http://hang.test:${port}/private/path?token=secret`);
+    const elapsed = Date.now() - started;
+    assert.equal(r.status, 504, JSON.stringify(r));
+    assert.ok(elapsed < 300 + 500, `answered after ${elapsed} ms`);
+    const event = proxy.events().at(-1);
+    assert.equal(event?.kind, "error");
+    assert.equal(event?.code, "dns_timeout");
+    assert.equal(event?.origin, `http://hang.test:${port}`);
+    assert.equal(r.headers["x-research-browser-denial"], undefined, "a timeout is not a policy denial");
+    assert.doesNotMatch(JSON.stringify(proxy.events()) + JSON.stringify(logs), /private|token|secret/);
+  });
+
+  it("never connects when the resolver answers after the deadline", { timeout: 5_000 }, async () => {
+    const proxy = await startEgressProxy(policy({ allowedHosts: parseHostAllowlist("late.test"), connectTimeoutMs: 200 }), {
+      ...deps,
+      resolve: () => new Promise<ResolvedAddress[]>((res) => setTimeout(() => res([{ address: "127.0.0.1", family: 4 }]), 500)),
+    });
+    proxies.push(proxy);
+    const r = await viaProxy(proxy, `http://late.test:${port}/late`);
+    assert.equal(r.status, 504, JSON.stringify(r));
+    await new Promise((res) => setTimeout(res, 600));
+    assert.deepEqual(hits, [], "no request may reach the origin after the deadline");
+  });
+
+  it("bounds CONNECT tunnels the same way", { timeout: 5_000 }, async () => {
+    const proxy = await startEgressProxy(policy({ allowedHosts: parseHostAllowlist("hang.test"), connectTimeoutMs: 300 }), {
+      ...deps,
+      resolve: () => new Promise<ResolvedAddress[]>(() => {}),
+    });
+    proxies.push(proxy);
+    const started = Date.now();
+    const r = await connect(proxy, `hang.test:${port}`);
+    r.socket.destroy();
+    assert.equal(r.status, 504);
+    assert.ok(Date.now() - started < 300 + 500);
+    assert.equal(proxy.events().at(-1)?.code, "dns_timeout");
+  });
+});
+
+describe("egress proxy diagnostics contract: resolver error classes (D2)", () => {
+  const cases: [string, string, number][] = [
+    ["ENOTFOUND", "dns_resolution_failed", 502],
+    ["ENODATA", "dns_resolution_failed", 502],
+    ["EAI_AGAIN", "dns_temporary_failure", 502],
+    ["ESERVFAIL", "dns_temporary_failure", 502],
+    ["ETIMEOUT", "dns_timeout", 504],
+  ];
+  for (const [errno, code, status] of cases) {
+    it(`maps ${errno} to ${code} without echoing the resolver message`, { timeout: 5_000 }, async () => {
+      const proxy = await startEgressProxy(policy({ allowedHosts: parseHostAllowlist("dnserr.test") }), {
+        ...deps,
+        resolve: async () => {
+          throw resolverError(errno, `getaddrinfo ${errno} dnserr.test via resolver-10-1-2-3.corp.internal`);
+        },
+      });
+      proxies.push(proxy);
+      const r = await viaProxy(proxy, `http://dnserr.test:${port}/`);
+      assert.equal(r.status, status, JSON.stringify(r));
+      const event = proxy.events().at(-1);
+      assert.equal(event?.kind, "error");
+      assert.equal(event?.code, code);
+      assert.doesNotMatch(JSON.stringify(proxy.events()) + JSON.stringify(logs) + r.body, /getaddrinfo|corp\.internal|resolver-10/);
+    });
+  }
+
+  it("keeps dns_resolution_failed for an error without a recognized code", { timeout: 5_000 }, async () => {
+    const proxy = await startEgressProxy(policy({ allowedHosts: parseHostAllowlist("dnserr.test") }), {
+      ...deps,
+      resolve: async () => {
+        throw new Error("something odd");
+      },
+    });
+    proxies.push(proxy);
+    const r = await viaProxy(proxy, `http://dnserr.test:${port}/`);
+    assert.equal(r.status, 502);
+    assert.equal(proxy.events().at(-1)?.code, "dns_resolution_failed");
+  });
+});

@@ -733,3 +733,157 @@ describe("browser request diagnostics", { skip: SKIP }, () => {
     assert.doesNotMatch(JSON.stringify(logs), /sensitive|secret|value/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Contract: docs/08-browser-diagnostics-contract.md (D1, D5, C1, C2, C3, L2, L3).
+// These tests are written before the implementation and fail until it lands.
+// ---------------------------------------------------------------------------
+
+type Blocked = { origin: string; code: string };
+type Failed = { origin: string; resource_type: string; status?: number; error_text?: string; proxy_code?: string };
+type Dropped = { blocked: number; failed: number };
+
+const contractResolve = async (h: string): Promise<ResolvedAddress[]> => {
+  if (h === "hang.test") return new Promise<ResolvedAddress[]>(() => {});
+  if (h === "slowdns.test") {
+    await new Promise((res) => setTimeout(res, 1_500));
+  } else {
+    const e = dns[h];
+    if (e) return e;
+  }
+  const err = new Error(`getaddrinfo ENOTFOUND ${h}`) as NodeJS.ErrnoException;
+  err.code = "ENOTFOUND";
+  throw err;
+};
+
+describe("browser diagnostics contract", { skip: SKIP }, () => {
+  it("D1: reports dns_timeout for a navigation whose name never resolves, within the connect budget", { timeout: 20_000 }, async () => {
+    const agent = makeAgent({ navigationTimeoutMs: 8_000 }, { resolve: contractResolve }, { allowedHosts: parseHostAllowlist("fixture.test hang.test") });
+    const id = await open(agent);
+    const started = Date.now();
+    const r = await agent.navigate(id, url("/sensitive/path?secret=value", "hang.test"));
+    const elapsed = Date.now() - started;
+    expect(r, "timeout", "dns_timeout");
+    assert.ok(elapsed < 4_000, `took ${elapsed} ms with connectTimeoutMs 1000 and navigationTimeoutMs 8000`);
+    assert.doesNotMatch(JSON.stringify(r) + JSON.stringify(logs), /sensitive|secret|value/);
+  });
+
+  it("D5: a policy denial in the navigation is not reported as an unrelated origin's connection error", { timeout: 20_000 }, async () => {
+    routes.set("/late-dns", page(`<title>Late</title><script>fetch("http://slowdns.test:${port}/x").catch(() => {});</script>`));
+    routes.set("/slow-redirect-out", (_req, res) => {
+      setTimeout(() => {
+        // HTTPS, so the denial arrives as a failed CONNECT and page.goto throws.
+        res.writeHead(302, { location: `https://other.test:${port}/` });
+        res.end();
+      }, 3_000);
+    });
+    const agent = makeAgent({}, { resolve: contractResolve }, { allowedHosts: parseHostAllowlist("fixture.test slowdns.test") });
+    const id = await open(agent);
+    expect(await agent.navigate(id, url("/late-dns")), "success");
+    const r = await agent.navigate(id, url("/slow-redirect-out"));
+    // The scenario only means something if the unrelated DNS failure really happened during this navigation.
+    assert.ok(
+      logs.some((l) => l.event === "egress" && l.kind === "error" && l.origin === `http://slowdns.test:${port}`),
+      "fixture did not produce the unrelated proxy error",
+    );
+    expect(r, "policy_denied", "host_not_allowlisted");
+  });
+
+  it("C1: every result carries diagnostics_dropped, and truncated entries are counted, not lost silently", { timeout: 20_000 }, async () => {
+    const agent = makeAgent();
+    const opened = await agent.openSession();
+    expect(opened, "success");
+    assert.deepEqual(opened.diagnostics_dropped, { blocked: 0, failed: 0 });
+    const id = opened.session_id!;
+    routes.set("/sixty-blocked", page(`<title>B</title>${Array.from({ length: 60 }, (_, i) => `<img src="http://other.test:${port}/p${i}.png?token=t">`).join("")}`));
+    const nav = await agent.navigate(id, url("/sixty-blocked"));
+    expect(nav, "success");
+    await new Promise((res) => setTimeout(res, 300));
+    const snap = await agent.snapshot(id);
+    let accounted = 0;
+    for (const r of [nav, snap]) {
+      const blocked = r.blocked_requests as Blocked[];
+      const dropped = r.diagnostics_dropped as Dropped | undefined;
+      assert.ok(blocked.length <= 20);
+      assert.ok(dropped, `diagnostics_dropped missing: ${JSON.stringify(Object.keys(r))}`);
+      accounted += blocked.length + dropped.blocked;
+    }
+    assert.equal(accounted, 60, "every blocked request is either listed or counted as dropped");
+  });
+
+  it("C2: requests listed in blocked_requests are not repeated in failed_requests or browser_request_failed logs", { timeout: 20_000 }, async () => {
+    const agent = makeAgent();
+    const id = await open(agent);
+    routes.set("/blocked-and-missing", page(`<title>BM</title>${[1, 2, 3].map((i) => `<img src="http://other.test:${port}/b${i}.png">`).join("")}<script src="/missing-contract.js"></script>`));
+    logs.length = 0;
+    const r = await agent.navigate(id, url("/blocked-and-missing"));
+    expect(r, "success");
+    const blocked = r.blocked_requests as Blocked[];
+    const failed = r.failed_requests as Failed[];
+    assert.equal(blocked.filter((b) => b.origin === `http://other.test:${port}`).length, 3, JSON.stringify(blocked));
+    assert.ok(failed.some((f) => f.origin === `http://fixture.test:${port}` && f.status === 404), JSON.stringify(failed));
+    assert.deepEqual(failed.filter((f) => f.origin === `http://other.test:${port}`), [], "blocked requests must not reappear as failed");
+    assert.ok(!failed.some((f) => f.error_text === "net::ERR_BLOCKED_BY_CLIENT"), JSON.stringify(failed));
+    assert.deepEqual(logs.filter((l) => l.event === "browser_request_failed" && l.origin === `http://other.test:${port}`), []);
+  });
+
+  it("C3: a failed subresource carries the proxy's error code, origin-only", { timeout: 20_000 }, async () => {
+    const agent = makeAgent({}, { resolve: contractResolve }, { allowedHosts: parseHostAllowlist("fixture.test dnsfail.test") });
+    const id = await open(agent);
+    routes.set("/sub-dns", page(`<title>S</title><img src="http://dnsfail.test:${port}/a.png?token=t"><script src="https://dnsfail.test:${port}/b.js?token=t"></script>`));
+    const r = await agent.navigate(id, url("/sub-dns"));
+    expect(r, "success");
+    const failed = r.failed_requests as Failed[];
+    for (const o of [`http://dnsfail.test:${port}`, `https://dnsfail.test:${port}`]) {
+      const entry = failed.find((f) => f.origin === o);
+      assert.ok(entry, `no failed entry for ${o}: ${JSON.stringify(failed)}`);
+      assert.equal(entry.proxy_code, "dns_resolution_failed", JSON.stringify(entry));
+    }
+    assert.doesNotMatch(JSON.stringify(r), /a\.png|b\.js|token/);
+  });
+
+  it("L3: a launch failure is logged without the raw error message or filesystem paths", { timeout: 20_000 }, async () => {
+    const agent = makeAgent({ executablePath: "/nonexistent/rb-secret-dir/chrome" });
+    logs.length = 0;
+    const r = await agent.openSession();
+    expect(r, "provider_unavailable", "browser_launch_failed");
+    const entry = logs.find((l) => l.event === "browser_launch_failed");
+    assert.ok(entry);
+    assert.doesNotMatch(JSON.stringify(logs) + JSON.stringify(r), /rb-secret-dir|nonexistent/);
+  });
+
+  it("L2: every browser and egress log event uses only its documented fields", { timeout: 30_000 }, async () => {
+    // Exercise every diagnostic path in one session so the check does not depend on test order.
+    const agent = makeAgent({}, { resolve: contractResolve }, { allowedHosts: parseHostAllowlist("fixture.test dnsfail.test") });
+    logs.length = 0;
+    const id = await open(agent);
+    routes.set("/all-diagnostics", page(`<title>All</title><img src="http://other.test:${port}/x.png"><script src="/missing-all.js"></script><img src="http://dnsfail.test:${port}/y.png">`));
+    await agent.navigate(id, url("/all-diagnostics?q=secret"));
+    await agent.navigate(id, url("/", "dnsfail.test"));
+    await agent.navigate(id, url("/captcha"));
+    await agent.closeSession(id);
+    await makeAgent({ executablePath: "/nonexistent/rb-secret-dir/chrome" }).openSession();
+
+    const allowed: Record<string, string[]> = {
+      egress: ["event", "decision", "kind", "origin", "code", "peer"],
+      browser_session_open: ["event", "session_id", "headless"],
+      browser_session_close: ["event", "session_id", "reason"],
+      browser_disconnected: ["event", "session_id"],
+      browser_request_blocked: ["event", "session_id", "origin", "code"],
+      browser_request_failed: ["event", "session_id", "origin", "resource_type", "status", "error_text", "proxy_code"],
+      browser_action: ["event", "session_id", "action", "request_id", "status", "code", "origin", "duration_ms"],
+      browser_blocked: ["event", "session_id", "origin", "challenge_type", "signals"],
+      browser_launch_failed: ["event", "code"],
+    };
+    const originShape = /^(https?:\/\/[^/?#@]+|\[non-http-url\]|\[unparseable-url\])$/;
+    assert.ok(logs.length > 0);
+    for (const entry of logs) {
+      const fields = allowed[String(entry.event)];
+      assert.ok(fields, `undocumented log event: ${JSON.stringify(entry)}`);
+      for (const k of Object.keys(entry)) assert.ok(fields.includes(k), `field ${k} is not documented for ${String(entry.event)}: ${JSON.stringify(entry)}`);
+      if (entry.origin !== undefined && entry.origin !== null) assert.match(String(entry.origin), originShape);
+      if (entry.error_text !== undefined) assert.match(String(entry.error_text), /^(net::ERR_[A-Z0-9_]+|request_failed)$/);
+    }
+    assert.doesNotMatch(JSON.stringify(logs), /secret|x\.png|y\.png|missing-all|rb-secret-dir/);
+  });
+});

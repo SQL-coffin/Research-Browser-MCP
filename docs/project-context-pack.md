@@ -1,5 +1,5 @@
 # Research-Browser-MCP — Project Context Pack
-Version: 1.1
+Version: 1.2
 Updated: 2026-10-24
 
 > Durable handoff notes for ChatGPT, Claude, and collaborating agents. Always verify repository state before acting. This document stores auditable conclusions and evidence, not hidden chain-of-thought.
@@ -51,12 +51,13 @@ Intended commands (check they exist in current package scripts): `npm run typech
 ## Repository / branch state — 2026-10-24
 Repository: `SQL-coffin/Research-Browser-MCP`.
 
-**Verified current branch head:** `claude/funny-hamilton-i5tgbw` at `08c59d0bae7c119834066e06fdffc88fcef6781c`. This is the merge commit for PR #4 and is the correct baseline for the current browser-diagnostics work. Do not use `main` as the baseline unless a new task explicitly requires it.
+**Verified current branch head:** `claude/funny-hamilton-i5tgbw` at `699de1518119020778552ce0bc14bc3137eafb36` (`docs: add MCP project context pack`), on top of `08c59d0bae7c119834066e06fdffc88fcef6781c`, the merge commit for PR #4. This is the baseline for the current browser-diagnostics work. Do not use `main` as the baseline unless a new task explicitly requires it; `main` (`3b0c467`) contains no browser code.
 
 - Prior diagnostics commit: `00be3a150b070afa5c73b960bd83bd4dec445f02`, message `fix: add origin-only browser network diagnostics`.
 - PR #4: https://github.com/SQL-coffin/Research-Browser-MCP/pull/4
 - PR #4 merged into `claude/funny-hamilton-i5tgbw`, not `main`. Its change only touched `tests/smoke/dist-browser.test.ts`, passing `LD_LIBRARY_PATH` through to the spawned browser server when present.
-- **User-confirmed:** CI run #8 logs were checked and show `npm test` 407/407 and smoke 22/22; typecheck also reported OK in PR #4 description. Preserve run #8 as the evidence source when linking the run in future notes.
+- **Verified:** [CI run #8](https://github.com/SQL-coffin/Research-Browser-MCP/actions/runs/39957963528) job log (event `pull_request`, head `2596781`): typecheck step succeeded; `npm test` `# tests 407 / # pass 407 / # fail 0`; smoke `# tests 22 / # pass 22 / # fail 0`. No separate CI run exists for merge commit `08c59d0`.
+- PR #4 root cause (from its commit message): the SDK's `StdioClientTransport` forwards only `HOME`, `LOGNAME`, `PATH`, `SHELL`, `TERM` and `USER`, so a Chromium found via `LD_LIBRARY_PATH` (user-local install on WSL) could not start in the spawned server. The fix is test-environment only; no `src/` or assertion change.
 - The branch head above was checked via GitHub during this session.
 
 ### Browser diagnostics commit
@@ -83,7 +84,21 @@ Intended contract: bounded proxy events (`seq`, origin, code, kind error/deny); 
 ## Current review / remediation baseline
 Use `claude/funny-hamilton-i5tgbw` at `08c59d0bae7c119834066e06fdffc88fcef6781c` as the baseline. Prefer a dedicated fix branch created from that exact SHA (for example, `fix/browser-diagnostics-boundaries`), then open a PR back into `claude/funny-hamilton-i5tgbw`. Do not modify `main` or merge a PR without explicit approval.
 
-A review artifact reportedly contains four reproduced boundary issues plus contract and failing-test drafts. The artifact content has not been accessible to this session; do not guess the four issues. Import/read the report before implementing. Convert each finding into a regression test and prove it fails before fixing.
+### Diagnostics review — 2026-10-24
+Review report: [诊断功能边界审查](https://claude.ai/artifact/KFBQSKwQRR4NX26RZw98ZL). Contract: [docs/08-browser-diagnostics-contract.md](08-browser-diagnostics-contract.md). Fix branch: `claude/project-thread-qmbcqx` from `699de15`; it holds the contract and failing regression tests only, with no `src/` change (**Planned**: implement after user review).
+
+**Verified** (reproduced with real Chromium against local fixtures, cloud Node 22.22.0; not yet run in the user's WSL):
+- D1: DNS resolution has no timeout; `connectTimeoutMs` starts after resolution. A hanging resolver ends as `navigation_timeout`, and the cause is lost.
+- D5: `navigationError` lets any origin's proxy error since the navigation started outrank a policy denial. An HTTPS redirect denial is then reported as `provider_unavailable` / `dns_resolution_failed`.
+- C1: `blocked_requests` / `failed_requests` are cut to 20 per result, and buffers hold 50, with no truncation signal. 60 blocked requests show as 20.
+- C2: browser-side blocked requests reappear in `failed_requests` as `net::ERR_BLOCKED_BY_CLIENT`.
+- C3: subresource proxy error codes (e.g. `dns_resolution_failed`) reach only the audit log, not results.
+- L3: `browser_launch_failed` logs Playwright's message, which contains the executable path.
+- No path, query, userinfo or token leak was found in diagnostic results or logs.
+
+**Unverified / code reading only:** D2 (all resolver errors collapse to `dns_resolution_failed`) is shown by tests, not seen in production. `proxy_closed` is returned but never recorded as an event.
+
+Test evidence on the fix branch (cloud, `CI=true`, not inside a loopback-only namespace because `ip` is unavailable there): typecheck OK; `npm test` 423 tests, 407 existing pass, 3 new guards pass, 13 new contract tests fail (11 assertion failures + 2 hangs cut by the 5 s test timeout).
 
 ## Agent delegation
 Suggested 8 specialist roles plus one Integration Agent:
