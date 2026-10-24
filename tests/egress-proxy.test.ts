@@ -1089,3 +1089,91 @@ describe("egress proxy diagnostics contract", () => {
     assert.deepEqual(hits, [], "a tunnel alone sends no request to the origin");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 1 contract: docs/08-browser-diagnostics-contract.md.
+// D1 tests are written before the implementation and fail until it lands. The
+// D2 tests are guards for behavior that is already correct.
+// ---------------------------------------------------------------------------
+
+/** Proposed in docs/08 §D1; the name needs reviewer approval before it is public. */
+const DNS_TIMEOUT_CODE = "dns_timeout";
+
+function resolverError(code: string, message: string): NodeJS.ErrnoException {
+  const err = new Error(message) as NodeJS.ErrnoException;
+  err.code = code;
+  return err;
+}
+
+async function startWithResolver(p: EgressPolicy, resolve: (host: string) => Promise<ResolvedAddress[]>): Promise<EgressProxy> {
+  const proxy = await startEgressProxy(p, { ...deps, resolve });
+  proxies.push(proxy);
+  return proxy;
+}
+
+const never = () => new Promise<ResolvedAddress[]>(() => {});
+
+describe("D1: name resolution is bounded by connectTimeoutMs", () => {
+  // Today the timer starts after resolution, so these requests never get a reply;
+  // the 5 s test timeout turns that hang into a failure instead of stalling the run.
+  it("plain HTTP: a resolver that never settles ends in 504 and one origin-only error event", { timeout: 5_000 }, async () => {
+    const proxy = await startWithResolver(policy({ allowedHosts: parseHostAllowlist("hang.test"), connectTimeoutMs: 300 }), never);
+    const started = Date.now();
+    const r = await viaProxy(proxy, `http://hang.test:${port}/private/path?token=secret#frag`);
+    const elapsed = Date.now() - started;
+    assert.equal(r.status, 504, JSON.stringify(r));
+    assert.ok(elapsed < 300 + 700, `answered after ${elapsed} ms`);
+    assert.equal(r.headers["x-research-browser-denial"], undefined, "a timeout is not a policy denial");
+    assert.equal(r.headers["x-research-browser-proxy-error"], DNS_TIMEOUT_CODE);
+    const errors = proxy.events().filter((e) => e.kind === "error");
+    assert.deepEqual(errors.map((e) => [e.origin, e.code]), [[`http://hang.test:${port}`, DNS_TIMEOUT_CODE]]);
+    assert.deepEqual(proxy.denials(), []);
+    assert.doesNotMatch(JSON.stringify(proxy.events()) + JSON.stringify(logs) + r.body, /private|token|secret|frag/);
+  });
+
+  it("CONNECT: a resolver that never settles ends in 504 and one origin-only error event", { timeout: 5_000 }, async () => {
+    const proxy = await startWithResolver(policy({ allowedHosts: parseHostAllowlist("hang.test"), connectTimeoutMs: 300 }), never);
+    const started = Date.now();
+    const r = await connect(proxy, `hang.test:${port}`);
+    r.socket.destroy();
+    assert.equal(r.status, 504);
+    assert.ok(Date.now() - started < 300 + 700);
+    assert.equal(r.headers["x-research-browser-denial"], undefined);
+    assert.deepEqual(proxy.events().map((e) => [e.kind, e.code]), [["error", DNS_TIMEOUT_CODE]]);
+  });
+
+  it("an answer that arrives after the deadline is never connected to", { timeout: 5_000 }, async () => {
+    // The answer is a valid, allowed address: only the deadline should stop the connection.
+    const proxy = await startWithResolver(policy({ allowedHosts: parseHostAllowlist("late.test"), connectTimeoutMs: 200 }), () =>
+      new Promise((res) => setTimeout(() => res([{ address: "127.0.0.1", family: 4 }]), 500)),
+    );
+    const r = await viaProxy(proxy, `http://late.test:${port}/late`);
+    assert.equal(r.status, 504, JSON.stringify(r));
+    // A negative check needs a bounded wait: 600 ms is past the late answer (500 ms) plus a connect on loopback.
+    await new Promise((res) => setTimeout(res, 600));
+    assert.ok(!hits.includes("/late"), "no request may reach the destination after the deadline");
+    assert.ok(!logs.some((l) => l.event === "egress" && l.decision === "allow"), JSON.stringify(logs));
+  });
+});
+
+describe("D2 guards: resolver errors never leak the resolver's message", () => {
+  // Realistic resolver errors carry err.code and a message naming the resolver.
+  const MESSAGE = (code: string) => `getaddrinfo ${code} dnserr.test via resolver-10-1-2-3.corp.internal`;
+  for (const errno of ["ENOTFOUND", "ENODATA", "EAI_AGAIN", "ESERVFAIL", "ETIMEOUT", "ECONNREFUSED"]) {
+    it(`${errno}: one origin-only error event, 502, no denial header, no resolver text`, { timeout: 5_000 }, async () => {
+      const proxy = await startWithResolver(policy({ allowedHosts: parseHostAllowlist("dnserr.test") }), async () => {
+        throw resolverError(errno, MESSAGE(errno));
+      });
+      const r = await viaProxy(proxy, `http://dnserr.test:${port}/`);
+      assert.equal(r.status, 502, JSON.stringify(r));
+      assert.equal(r.headers["x-research-browser-denial"], undefined);
+      const errors = proxy.events().filter((e) => e.kind === "error");
+      assert.equal(errors.length, 1);
+      assert.equal(errors[0]!.origin, `http://dnserr.test:${port}`);
+      // Today every resolver failure is dns_resolution_failed. docs/08 §D2 proposes finer codes;
+      // until that is approved this guard pins only the privacy property and the family.
+      assert.match(errors[0]!.code, /^dns_[a-z_]+$/);
+      assert.doesNotMatch(JSON.stringify(proxy.events()) + JSON.stringify(logs) + r.body + JSON.stringify(r.headers), /getaddrinfo|corp\.internal|resolver-10/);
+    });
+  }
+});

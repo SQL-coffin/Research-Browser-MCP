@@ -1006,3 +1006,123 @@ describe("TLS error tokens", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 1 contract: docs/08-browser-diagnostics-contract.md. D1 and L3 fail
+// until they are implemented; L2 fails today only through L3; C1 is a guard.
+// ---------------------------------------------------------------------------
+
+/** Proposed in docs/08 §D1; the name needs reviewer approval before it is public. */
+const DNS_TIMEOUT_CODE = "dns_timeout";
+
+describe("D1 a navigation whose name never resolves", { skip: SKIP }, () => {
+  it("is timeout / dns_timeout within the connect budget, not navigation_timeout at the navigation deadline", T, async () => {
+    const agent = makeAgent(
+      { navigationTimeoutMs: 8_000 },
+      { resolve: (h) => (h === "hang.test" ? new Promise<ResolvedAddress[]>(() => {}) : Promise.resolve(dns[h] ?? [])) },
+      { allowedHosts: parseHostAllowlist("fixture.test hang.test"), connectTimeoutMs: 1_000 },
+    );
+    const id = await open(agent);
+    const started = Date.now();
+    const r = await agent.navigate(id, url("/d1/private?token=secret", "hang.test"));
+    const elapsed = Date.now() - started;
+    expect(r, "timeout", DNS_TIMEOUT_CODE);
+    assert.ok(elapsed < 4_000, `took ${elapsed} ms with connectTimeoutMs 1000 and navigationTimeoutMs 8000`);
+    assertDiagnosticsShape("navigate", r);
+    assert.ok(logs.some((l) => l.event === "egress" && l.kind === "error" && l.code === DNS_TIMEOUT_CODE && l.origin === `http://hang.test:${port}`), JSON.stringify(logs.slice(-5)));
+    assert.doesNotMatch(JSON.stringify(r) + JSON.stringify(logs), /d1\/private|token|secret/);
+  });
+});
+
+describe("C1 guard: truncation past the 50-entry buffers still warns", { skip: SKIP }, () => {
+  it("60 refusals between two results: 20 listed, request_diagnostics_truncated, all 60 in the audit log", T, async () => {
+    holdRoute("/c1-gate");
+    routes.set("/c1-done", html("ok"));
+    routes.set(
+      "/c1",
+      html(() => `<title>C1</title><script>
+        fetch("/c1-gate").then(() => Promise.allSettled([${Array.from({ length: 60 }, (_, i) => `fetch("${OTHER()}/c1-${i}?token=t")`).join(",")}])).then(() => fetch("/c1-done")).catch(() => {});
+      </script>`),
+    );
+    const agent = makeAgent();
+    const id = await open(agent);
+    expect(await agent.navigate(id, url("/c1")), "success");
+    logs.length = 0;
+    await release("/c1-gate");
+    await waitFor(() => hits.some((h) => h.path === "/c1-done"), "the page finished its 60 requests");
+    await waitFor(() => logs.filter((l) => l.event === "browser_request_blocked" && l.origin === OTHER()).length === 60, "60 refusals logged");
+    const r = await agent.snapshot(id);
+    expect(r, "success");
+    assertDiagnosticsShape("snapshot", r);
+    assert.equal(blockedOf(r).length, 20, JSON.stringify(r.blocked_requests));
+    assert.ok(r.warnings.includes("request_diagnostics_truncated"), `warnings: ${JSON.stringify(r.warnings)}`);
+    const next = await agent.snapshot(id);
+    assert.deepEqual(next.blocked_requests, []);
+    assert.ok(!next.warnings.includes("request_diagnostics_truncated"), `warnings: ${JSON.stringify(next.warnings)}`);
+  });
+});
+
+describe("L3 browser launch failures", { skip: SKIP }, () => {
+  it("log no raw error message or filesystem path", T, async () => {
+    const agent = makeAgent({ executablePath: "/nonexistent/rb-secret-dir/chrome" });
+    logs.length = 0;
+    const r = await agent.openSession();
+    expect(r, "provider_unavailable", "browser_launch_failed");
+    assert.deepEqual(logs.filter((l) => l.event === "browser_launch_failed"), [{ event: "browser_launch_failed", code: "executable_missing" }]);
+    assert.doesNotMatch(JSON.stringify(logs) + JSON.stringify(r), /rb-secret-dir|nonexistent|browserType\.launch/);
+  });
+
+  it("log launch_failed for an executable that exists but is not a browser", T, async () => {
+    // /bin/false exists and exits at once, so the launch fails for a reason other than a missing file.
+    const agent = makeAgent({ executablePath: "/bin/false", launchTimeoutMs: 5_000 });
+    logs.length = 0;
+    const r = await agent.openSession();
+    expect(r, "provider_unavailable", "browser_launch_failed");
+    assert.deepEqual(logs.filter((l) => l.event === "browser_launch_failed"), [{ event: "browser_launch_failed", code: "launch_failed" }]);
+    assert.doesNotMatch(JSON.stringify(logs) + JSON.stringify(r), /\/bin\/false|browserType\.launch/);
+  });
+});
+
+describe("L2 audit log fields are an allowlist", { skip: SKIP }, () => {
+  it("every browser and egress event carries only its documented fields", T, async () => {
+    const allowed: Record<string, string[]> = {
+      egress: ["event", "decision", "kind", "transport", "origin", "code", "peer"],
+      browser_session_open: ["event", "session_id", "headless"],
+      browser_session_close: ["event", "session_id", "reason"],
+      browser_disconnected: ["event", "session_id"],
+      browser_request_blocked: ["event", "session_id", "origin", "code"],
+      browser_request_failed: ["event", "session_id", "origin", "resource_type", "status", "error_text"],
+      browser_action: ["event", "session_id", "action", "request_id", "status", "code", "origin", "duration_ms"],
+      browser_blocked: ["event", "session_id", "origin", "challenge_type", "signals"],
+      browser_launch_failed: ["event", "code"],
+    };
+    routes.set("/l2", html(() => `<title>L2</title><img src="${OTHER()}/x.png?token=t"><script src="/l2-missing.js?token=t"></script><img src="${DNSFAIL()}/y.png?token=t">`));
+    routes.set("/l2-captcha", html(`<html><head><title>Just a moment</title></head><body><div class="g-recaptcha" data-sitekey="x"></div><p>Verify you are human</p></body></html>`, 403));
+    logs.length = 0;
+    const agent = makeAgent();
+    const id = await open(agent);
+    const nav = await agent.navigate(id, url("/l2?q=secret"));
+    await snapshotsUntil(agent, id, "l2", (failed, blocked) => blocked.some((b) => b.origin === OTHER()) && failed.some((f) => f.origin === DNSFAIL()), [nav]);
+    await agent.navigate(id, url("/", "dnsfail.test"));
+    await agent.navigate(id, url("/l2-captcha"));
+    await agent.closeSession(id);
+    await makeAgent({ executablePath: "/nonexistent/rb-secret-dir/chrome" }).openSession();
+
+    const origin = /^(https?:\/\/[^/?#@]+|\[non-http-url\]|\[unparseable-url\]|\[invalid-host\])$/;
+    const seen = new Set<string>();
+    for (const entry of logs) {
+      const event = String(entry.event);
+      const fields = allowed[event];
+      assert.ok(fields, `undocumented log event: ${JSON.stringify(entry)}`);
+      seen.add(event);
+      for (const k of Object.keys(entry)) assert.ok(fields.includes(k), `field ${k} is not documented for ${event}: ${JSON.stringify(entry)}`);
+      if (entry.origin !== undefined && entry.origin !== null) assert.match(String(entry.origin), origin);
+      if (entry.error_text !== undefined) assert.match(String(entry.error_text), /^(net::ERR_[A-Z0-9_]+|request_failed)$/);
+    }
+    // The run must actually have produced the events it checks.
+    for (const e of ["egress", "browser_session_open", "browser_session_close", "browser_request_blocked", "browser_request_failed", "browser_action", "browser_blocked", "browser_launch_failed"]) {
+      assert.ok(seen.has(e), `no ${e} event was produced`);
+    }
+    assert.doesNotMatch(JSON.stringify(logs), /secret|token|x\.png|y\.png|l2-missing|rb-secret-dir/);
+  });
+});

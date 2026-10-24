@@ -186,7 +186,8 @@ export function verifyPeer(remoteAddress: string | undefined, pinned: string, po
 /**
  * Resolves `hostname` (or takes the IP literal), validates every answer, connects
  * to the validated address only and checks the connected peer before resolving,
- * so no byte is written to a peer the policy rejects. Used by the browser egress
+ * so no byte is written to a peer the policy rejects. Resolution and connect share
+ * `timeoutMs` (dns_timeout, then connect_timeout). Used by the browser egress
  * proxy, which relays the browser's traffic over the returned socket.
  * Throws FetchStop on any policy or connection failure.
  */
@@ -198,14 +199,30 @@ export async function connectPinned(
   deps: Pick<FetchDeps, "resolve">,
   timeoutMs: number,
 ): Promise<{ socket: Socket; peer: string }> {
-  const pinned = await resolveAndValidate(hostname, ipLiteral, policy, deps);
+  // One budget covers resolution and connect. An answer that arrives after the
+  // deadline is dropped: nothing is connected to it.
+  const deadline = Date.now() + timeoutMs;
+  let dnsTimer: NodeJS.Timeout | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    dnsTimer = setTimeout(() => reject(new FetchStop("timeout", "dns_timeout", "Host name resolution timed out")), timeoutMs);
+  });
+  const resolving = resolveAndValidate(hostname, ipLiteral, policy, deps);
+  resolving.catch(() => {});
+  let pinned: ResolvedAddress;
+  try {
+    pinned = await Promise.race([resolving, expired]);
+  } finally {
+    clearTimeout(dnsTimer);
+  }
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw new FetchStop("timeout", "connect_timeout", "Connection timed out");
   return new Promise((resolve, reject) => {
     // Connecting to the address itself: no lookup, so nothing can re-resolve the name.
     const socket = net.connect({ host: pinned.address, port, family: pinned.family });
     const timer = setTimeout(() => {
       socket.destroy();
       reject(new FetchStop("timeout", "connect_timeout", "Connection timed out"));
-    }, timeoutMs);
+    }, remaining);
     socket.prependOnceListener("connect", () => {
       clearTimeout(timer);
       try {
