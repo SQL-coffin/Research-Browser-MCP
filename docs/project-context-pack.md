@@ -1,5 +1,5 @@
 # Research-Browser-MCP — Project Context Pack
-Version: 1.1
+Version: 1.2
 Updated: 2026-10-24
 
 > Durable handoff notes for ChatGPT, Claude, and collaborating agents. Always verify repository state before acting. This document stores auditable conclusions and evidence, not hidden chain-of-thought.
@@ -51,12 +51,12 @@ Intended commands (check they exist in current package scripts): `npm run typech
 ## Repository / branch state — 2026-10-24
 Repository: `SQL-coffin/Research-Browser-MCP`.
 
-**Verified current branch head:** `claude/funny-hamilton-i5tgbw` at `08c59d0bae7c119834066e06fdffc88fcef6781c`. This is the merge commit for PR #4 and is the correct baseline for the current browser-diagnostics work. Do not use `main` as the baseline unless a new task explicitly requires it.
+**Verified branch head (2026-10-24 04:55Z):** `claude/funny-hamilton-i5tgbw` at `125cd65` (`fix: accurate, origin-only browser network diagnostics`, pushed by another Claude session at 01:16Z), on top of `699de15` (this Context Pack) and `08c59d0` (PR #4 merge). Do not use `main` as the baseline unless a new task explicitly requires it; `main` (`3b0c467`) contains no browser code.
 
 - Prior diagnostics commit: `00be3a150b070afa5c73b960bd83bd4dec445f02`, message `fix: add origin-only browser network diagnostics`.
 - PR #4: https://github.com/SQL-coffin/Research-Browser-MCP/pull/4
 - PR #4 merged into `claude/funny-hamilton-i5tgbw`, not `main`. Its change only touched `tests/smoke/dist-browser.test.ts`, passing `LD_LIBRARY_PATH` through to the spawned browser server when present.
-- **User-confirmed:** CI run #8 logs were checked and show `npm test` 407/407 and smoke 22/22; typecheck also reported OK in PR #4 description. Preserve run #8 as the evidence source when linking the run in future notes.
+- **Verified:** [CI run #8](https://github.com/SQL-coffin/Research-Browser-MCP/actions/runs/39957963528) job log (event `pull_request`, head `2596781`): `npm test` `# tests 407 / # pass 407 / # fail 0`; smoke `# tests 22 / # pass 22 / # fail 0`; typecheck step succeeded. No separate CI run exists for merge commit `08c59d0`.
 - The branch head above was checked via GitHub during this session.
 
 ### Browser diagnostics commit
@@ -83,7 +83,11 @@ Intended contract: bounded proxy events (`seq`, origin, code, kind error/deny); 
 ## Current review / remediation baseline
 Use `claude/funny-hamilton-i5tgbw` at `08c59d0bae7c119834066e06fdffc88fcef6781c` as the baseline. Prefer a dedicated fix branch created from that exact SHA (for example, `fix/browser-diagnostics-boundaries`), then open a PR back into `claude/funny-hamilton-i5tgbw`. Do not modify `main` or merge a PR without explicit approval.
 
-A review artifact reportedly contains four reproduced boundary issues plus contract and failing-test drafts. The artifact content has not been accessible to this session; do not guess the four issues. Import/read the report before implementing. Convert each finding into a regression test and prove it fails before fixing.
+### Diagnostics review and Phase 1 — 2026-10-24
+- Review report: [诊断功能边界审查](https://claude.ai/artifact/KFBQSKwQRR4NX26RZw98ZL) (findings against `08c59d0`/`699de15`).
+- `125cd65` landed after `699de15` and fixed D5, C2 and C5, and C1 for up to 50 entries; findings were re-checked against it.
+- Phase 1 branch `fix/browser-diagnostics-boundaries`, from `125cd65`, holds the contract and tests only: [docs/08-browser-diagnostics-contract.md](08-browser-diagnostics-contract.md). Open defects with red tests: D1 (DNS resolution unbounded; a late answer is still connected to) and L3 (`browser_launch_failed` logs the executable path). L2 is an allowlist test that is red only through L3. D2, C1-counts and C3 are untested proposals awaiting a decision. A backlog is in docs/08.
+- **Pending human decision:** approve the contract and the `dns_timeout` name before Phase 2. An earlier draft on `claude/project-thread-qmbcqx` (PR #5, based on `699de15`) is superseded.
 
 ## Agent delegation
 Suggested 8 specialist roles plus one Integration Agent:
