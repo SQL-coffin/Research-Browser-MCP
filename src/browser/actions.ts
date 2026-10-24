@@ -126,6 +126,12 @@ class ActionStop extends Error {
   }
 }
 
+/** The category of a browser launch failure, decided from the error but never containing its text. */
+function launchFailureCode(err: unknown): "executable_missing" | "launch_failed" {
+  const message = err instanceof Error ? err.message : String(err);
+  return /executable doesn't exist/i.test(message) ? "executable_missing" : "launch_failed";
+}
+
 const SENSITIVE_AUTOCOMPLETE = /(^|\s)(current-password|new-password|one-time-code|cc-[a-z-]+)(\s|$)/;
 const NOT_TYPEABLE = new Set(["file", "hidden", "checkbox", "radio", "submit", "button", "reset", "image", "range", "color"]);
 
@@ -162,8 +168,8 @@ export class BrowserAgent {
     try {
       session = await BrowserSession.launch(this.config, this.deps);
     } catch (err) {
-      // Launch errors can name local paths; log them, return a fixed message.
-      this.deps.log({ event: "browser_launch_failed", message: err instanceof Error ? err.message.split("\n")[0] : String(err) });
+      // Launch errors name local paths: log only a fixed category, never the message.
+      this.deps.log({ event: "browser_launch_failed", code: launchFailureCode(err) });
       return this.fail(request_id, null, "provider_unavailable", "browser_launch_failed", "The browser could not be started on the server");
     } finally {
       this.opening--;

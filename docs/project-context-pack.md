@@ -87,7 +87,8 @@ Use `claude/funny-hamilton-i5tgbw` at `08c59d0bae7c119834066e06fdffc88fcef6781c`
 - Review report: [诊断功能边界审查](https://claude.ai/artifact/KFBQSKwQRR4NX26RZw98ZL) (findings against `08c59d0`/`699de15`).
 - `125cd65` landed after `699de15` and fixed D5, C2 and C5, and C1 for up to 50 entries; findings were re-checked against it.
 - Phase 1 branch `fix/browser-diagnostics-boundaries`, from `125cd65`, holds the contract and tests only: [docs/08-browser-diagnostics-contract.md](08-browser-diagnostics-contract.md). Open defects with red tests: D1 (DNS resolution unbounded; a late answer is still connected to) and L3 (`browser_launch_failed` logs the executable path). L2 is an allowlist test that is red only through L3. D2, C1-counts and C3 are untested proposals awaiting a decision. A backlog is in docs/08.
-- **Pending human decision:** approve the contract and the `dns_timeout` name before Phase 2. An earlier draft on `claude/project-thread-qmbcqx` (PR #5, based on `699de15`) is superseded.
+- **Decided (user, 2026-10-24 09:58Z):** contract approved, baseline `125cd65`, D1 code `dns_timeout`. PR #7 stays a draft; merging is a separate decision after acceptance. PR #5 (`claude/project-thread-qmbcqx`, from `699de15`) was closed as superseded.
+- Phase 2 (same branch): `connectPinned` bounds resolution + connect by `connectTimeoutMs` (`dns_timeout`, 504; a late answer is dropped); navigation maps `dns_timeout` to `timeout`; `browser_launch_failed` logs only `code` (`executable_missing` | `launch_failed`). `research.fetch_public_page` is unchanged.
 
 ## Agent delegation
 Suggested 8 specialist roles plus one Integration Agent:

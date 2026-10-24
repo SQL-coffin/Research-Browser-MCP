@@ -127,6 +127,10 @@ Audit log lines are JSON objects on stderr, each with `ts` and `tool_version`. T
 | `browser_request_blocked` | `session_id`, `origin`, `code` |
 | `browser_request_failed` | `session_id`, `origin`, `resource_type`, and `status` or `error_text` |
 | `browser_action` | `session_id`, `action`, `request_id`, `status`, `code` (on errors), the page's `origin`, `duration_ms` |
+| `browser_launch_failed` | `code`: `executable_missing` or `launch_failed`. Never the launch error's text, which names local paths. |
+
+These field sets, and those of the session events, are an allowlist: test L2 in `tests/browser-diagnostics.test.ts` fails on any other field ([08-browser-diagnostics-contract.md](08-browser-diagnostics-contract.md)).
+
 The audit log has every entry, even when a result's lists were truncated. **None of these diagnostics, in results, proxy events or logs, contains a path, query, fragment, header, cookie, request or response body, or typed text.** Test T6 in `tests/browser-diagnostics.test.ts` and the P4 tests in `tests/egress-proxy.test.ts` put marker values in those places and check that none reaches a result or log line.
 
 ### Diagnosing a failed page

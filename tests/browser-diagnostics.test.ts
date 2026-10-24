@@ -1068,8 +1068,18 @@ describe("L3 browser launch failures", { skip: SKIP }, () => {
     logs.length = 0;
     const r = await agent.openSession();
     expect(r, "provider_unavailable", "browser_launch_failed");
-    assert.ok(logs.some((l) => l.event === "browser_launch_failed"), JSON.stringify(logs));
+    assert.deepEqual(logs.filter((l) => l.event === "browser_launch_failed"), [{ event: "browser_launch_failed", code: "executable_missing" }]);
     assert.doesNotMatch(JSON.stringify(logs) + JSON.stringify(r), /rb-secret-dir|nonexistent|browserType\.launch/);
+  });
+
+  it("log launch_failed for an executable that exists but is not a browser", T, async () => {
+    // /bin/false exists and exits at once, so the launch fails for a reason other than a missing file.
+    const agent = makeAgent({ executablePath: "/bin/false", launchTimeoutMs: 5_000 });
+    logs.length = 0;
+    const r = await agent.openSession();
+    expect(r, "provider_unavailable", "browser_launch_failed");
+    assert.deepEqual(logs.filter((l) => l.event === "browser_launch_failed"), [{ event: "browser_launch_failed", code: "launch_failed" }]);
+    assert.doesNotMatch(JSON.stringify(logs) + JSON.stringify(r), /\/bin\/false|browserType\.launch/);
   });
 });
 

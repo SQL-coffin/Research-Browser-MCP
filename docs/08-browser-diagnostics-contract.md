@@ -1,6 +1,6 @@
 # 08 — Browser diagnostics boundaries: Phase 1 contract
 
-Status: **Phase 1, waiting for review.** This document and the regression tests are committed before any implementation. Production code is unchanged from `125cd65`. Names marked *proposed* are not approved public API.
+Status: **Phase 2 implemented, waiting for review (2026-10-24).** The reviewer approved the contract for D1, L3 and L2, the `125cd65` baseline and the name `dns_timeout`. The D2, C1-count and C3 proposals stay unapproved.
 
 Baseline: `claude/funny-hamilton-i5tgbw` at `125cd65`. Its ancestor `699de15` is the required baseline. `125cd65` (`fix: accurate, origin-only browser network diagnostics`) landed on that branch after `699de15` and already changes the diagnostics this review covered. Every finding below was re-checked against `125cd65`. Its own contract is [07-browser-agent.md](07-browser-agent.md) §4.
 
@@ -29,16 +29,16 @@ Baseline: `claude/funny-hamilton-i5tgbw` at `125cd65`. Its ancestor `699de15` is
 Input: a proxied request (plain HTTP or CONNECT) to an allowlisted name whose resolver does not settle.
 
 - Resolution and TCP connect together finish within `connectTimeoutMs`.
-- On expiry: `status: "timeout"`, `code: dns_timeout` (*proposed*). Plain HTTP gets 504 with `x-research-browser-proxy-error: dns_timeout`, and CONNECT gets 504. Neither carries the denial header. One `error` proxy event is recorded, origin only.
+- On expiry: `status: "timeout"`, `code: dns_timeout` (approved). Plain HTTP gets 504 with `x-research-browser-proxy-error: dns_timeout`, and CONNECT gets 504. Neither carries the denial header. One `error` proxy event is recorded, origin only.
 - An answer that arrives after the deadline is discarded. No connection is made, and no `allow` line is logged.
 - A navigation whose only failure is this is `timeout` / `dns_timeout`, within roughly the connect budget, not `navigation_timeout` at the navigation deadline.
 - Non-goals: changing the resolver, retrying, caching, or the fetch tool's own timeouts.
 
-**Decision needed:** the code name. Option A is `dns_timeout`, which is new and tells a resolver problem apart from an unreachable destination; I recommend it. Option B is to reuse `connect_timeout`, which adds no new code but loses the cause. The tests use one constant, `DNS_TIMEOUT_CODE`, so changing the name is a one-line edit.
+Decision (reviewer, 2026-10-24): `dns_timeout`, so that a resolution timeout is told apart from a TCP connect timeout after a successful resolution. Scope: the browser egress proxy (`connectPinned`). `research.fetch_public_page` keeps its own deadlines and is unchanged.
 
 ## L3 — Launch failures log no raw message
 
-- `browser_launch_failed` logs only `event` and `code`. `code` is a fixed category such as `executable_missing` or `launch_failed` (*proposed values*), never error text.
+- `browser_launch_failed` logs only `event` and `code`. `code` is `executable_missing` (Playwright reports the executable does not exist) or `launch_failed` (anything else), never error text.
 - The tool result is unchanged: `provider_unavailable` / `browser_launch_failed` with a fixed message.
 
 ## L2 — Audit log fields are an allowlist
@@ -75,7 +75,18 @@ Input: a proxied request (plain HTTP or CONNECT) to an allowlisted name whose re
 | L5 | `kind` meant two things in `egress` lines. | Fixed by 125cd65 (`transport`) | Runtime (L2 test) |
 | P1 | `admit` returns `proxy_closed` without recording an event. | Low | Code reading |
 
-## Tests
+## Phase 2 result
+
+| Test | Before (86098d3) | After |
+|---|---|---|
+| D1 plain HTTP, CONNECT, late answer | FAIL (2 hangs, `200`) | PASS |
+| D1 navigation | FAIL (`navigation_timeout`) | PASS |
+| L3 `executable_missing` | FAIL (path in `message`) | PASS |
+| L3 `launch_failed` (added in Phase 2; it pins the second category) | n/a | PASS |
+| L2 | FAIL (through L3) | PASS |
+| Guards (D2 ×6, C1) and the 469 tests from 125cd65 | PASS | PASS |
+
+## Tests (Phase 1 record)
 
 | Test | File | Today on 125cd65 | Why |
 |---|---|---|---|
