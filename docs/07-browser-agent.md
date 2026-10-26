@@ -34,7 +34,7 @@ Chromium ──(--proxy-server, no loopback bypass, per-proxy credentials)──
 - **TLS is not terminated.** HTTPS is a CONNECT tunnel; Chromium verifies the destination certificate itself, and certificate errors are never ignored (`ignoreHTTPSErrors: false`).
 - **Method rule.** Only `GET` and `HEAD` are allowed, except on hosts listed in `RESEARCH_BROWSER_FORM_SUBMIT_HOSTS`. The proxy enforces this for plain HTTP; inside an HTTPS tunnel only the browser can see the method, so the in-browser request handler enforces it there.
 - **Off:** WebSockets, service workers, downloads, popups (closed when they open), JavaScript dialogs (dismissed), QUIC, and WebRTC UDP that does not go through the proxy.
-- **Limits per session:** 10 MiB per plain-HTTP response, 200 MiB relayed in total, 64 connections, 60 s idle per connection, 5 s connect timeout.
+- **Limits per session:** 10 MiB per plain-HTTP response, 200 MiB relayed in total, 64 connections, 60 s idle per connection, 5 s for name resolution and connect together.
 
 ## 3. Sessions
 
@@ -93,7 +93,7 @@ When Chromium cannot load the page, `error.code` comes from the navigation's **o
 |---|---|---|---|
 | 1 | A proxy denial for an own origin (only the proxy can refuse a navigation hop) | `policy_denied` | the denial's code |
 | 2 | Chromium's error is a certificate or TLS error (`net::ERR_CERT_*`, `net::ERR_CERTIFICATE_*`, `net::ERR_SSL_*`, `net::ERR_BAD_SSL_*`, `net::ERR_TLS13_DOWNGRADE_DETECTED`, `net::ERR_ECH_FALLBACK_CERTIFICATE_INVALID`) | `policy_denied` | `tls_verification_failed` |
-| 3 | A proxy error for an own origin before a connection existed | `provider_unavailable` (`timeout` for `connect_timeout`) | `dns_resolution_failed`, `dns_no_answer`, `connection_failed` or `connect_timeout` |
+| 3 | A proxy error for an own origin before a connection existed | `provider_unavailable` (`timeout` for `dns_timeout` and `connect_timeout`) | `dns_resolution_failed`, `dns_no_answer`, `dns_timeout`, `connection_failed` or `connect_timeout` |
 | 4 | The navigation timeout | `timeout` | `navigation_timeout` |
 | 5 | `net::ERR_ABORTED` or a download, which is refused | `blocked` | `navigation_aborted` |
 | 6 | A proxy `upstream_error` for an own origin | `provider_unavailable` | `upstream_error` |
@@ -102,7 +102,7 @@ When Chromium cannot load the page, `error.code` comes from the navigation's **o
 
 Anything else is a generic browser error, such as `browser_closed`. When Chromium's error has a token, `net_error` is that token (`net::ERR_[A-Z0-9_]+`), never the message. It is read only where Playwright puts it, at the very start of the error message; a message that starts otherwise (for example one quoting the URLs of an interrupted navigation) gives no token, so words in a URL do not become `net_error` or decide a rule. Behind the proxy, Chromium usually reports an HTTPS tunnel that the proxy refused or could not open as `net::ERR_TUNNEL_CONNECTION_FAILED`, whatever the reason; `error.code` names the cause, `net_error` does not.
 
-Over plain HTTP the proxy answers refusals and errors itself, so the navigation gets a response instead of an error. Such a response decides the result when it carries `x-research-browser-denial` (then `policy_denied`) or `x-research-browser-proxy-error` (then `provider_unavailable`, or `timeout` for `connect_timeout`) with a plain code as its value. On plain HTTP these headers can only be the proxy's own, because the proxy removes both from every destination reply. There is no `net_error` in that case. An HTTPS response always comes from the destination, so its headers never decide the result, and a page's own error status (for example a 503 CAPTCHA page) goes to the challenge check as usual.
+Over plain HTTP the proxy answers refusals and errors itself, so the navigation gets a response instead of an error. Such a response decides the result when it carries `x-research-browser-denial` (then `policy_denied`) or `x-research-browser-proxy-error` (then `provider_unavailable`, or `timeout` for `dns_timeout` and `connect_timeout`) with a plain code as its value. On plain HTTP these headers can only be the proxy's own, because the proxy removes both from every destination reply. There is no `net_error` in that case. An HTTPS response always comes from the destination, so its headers never decide the result, and a page's own error status (for example a 503 CAPTCHA page) goes to the challenge check as usual.
 
 ### Proxy events and audit log
 
@@ -113,7 +113,8 @@ Each session's proxy keeps its newest 50 denials and, separately, its newest 50 
 | `deny` | URL policy codes (`host_not_allowlisted`, `port_not_allowed`, …), `address_*` and `peer_*` (non-public DNS answer or peer), `method_not_allowed`, `session_byte_budget_exceeded`, `upgrade_not_allowed` | Before anything is sent to the destination | `403` (`400` for an invalid URL) with `x-research-browser-denial: <code>` |
 | `deny` | `response_too_large` | A plain-HTTP response passed 10 MiB | The response is cut off |
 | `error` | `dns_resolution_failed`, `dns_no_answer`, `connection_failed` | The name did not resolve or had no address, or the connect failed | `502`; on plain HTTP with `x-research-browser-proxy-error: <code>` (a CONNECT reply carries no header) |
-| `error` | `connect_timeout` | No connection within 5 s | `504`; on plain HTTP with `x-research-browser-proxy-error: connect_timeout` |
+| `error` | `dns_timeout` | The name did not resolve within the connect budget (5 s for resolution and connect together); an answer that arrives later is dropped and never connected to | `504`; on plain HTTP with `x-research-browser-proxy-error: dns_timeout` |
+| `error` | `connect_timeout` | No connection within what is left of that 5 s budget | `504`; on plain HTTP with `x-research-browser-proxy-error: connect_timeout` |
 | `error` | `upstream_error` | The destination reset or dropped an admitted connection before the response ended (plain HTTP), or before it sent any byte (tunnel). Once per connection; not for a normal close, an idle timeout, the byte limits, the session byte budget or proxy shutdown. Inside a tunnel a reset after the destination has sent data cannot be told from a normal end, so it is not recorded. | `502` with `x-research-browser-proxy-error: upstream_error` (plain HTTP) if no response had started, otherwise the connection is closed |
 
 Only denials carry `x-research-browser-denial`, and only proxy errors carry `x-research-browser-proxy-error`, so a proxy error is never read as a policy refusal. On plain HTTP the proxy removes both headers from destination responses. Over HTTPS the proxy cannot see or change the destination's headers, which is why only plain-HTTP replies are ever read for them.
@@ -126,6 +127,9 @@ Audit log lines are JSON objects on stderr, each with `ts` and `tool_version`. T
 | `browser_request_blocked` | `session_id`, `origin`, `code` |
 | `browser_request_failed` | `session_id`, `origin`, `resource_type`, and `status` or `error_text` |
 | `browser_action` | `session_id`, `action`, `request_id`, `status`, `code` (on errors), the page's `origin`, `duration_ms` |
+| `browser_launch_failed` | `code`: `executable_missing` or `launch_failed`. Never the launch error's text, which names local paths. |
+
+These field sets, and those of the session events, are an allowlist: test L2 in `tests/browser-diagnostics.test.ts` fails on any other field ([08-browser-diagnostics-contract.md](08-browser-diagnostics-contract.md)).
 
 The audit log has every entry, even when a result's lists were truncated. **None of these diagnostics, in results, proxy events or logs, contains a path, query, fragment, header, cookie, request or response body, or typed text.** Test T6 in `tests/browser-diagnostics.test.ts` and the P4 tests in `tests/egress-proxy.test.ts` put marker values in those places and check that none reaches a result or log line.
 
@@ -134,7 +138,7 @@ The audit log has every entry, even when a result's lists were truncated. **None
 | Cause | What shows it |
 |---|---|
 | Policy refusal | `policy_denied` with a policy code; an entry in `blocked_requests`; a `browser_request_blocked` line or an `egress` line with `decision: "deny"`. The fix is the configuration, not a retry. |
-| DNS or connection problem | `error.code` `dns_resolution_failed`, `dns_no_answer`, `connection_failed` or `connect_timeout`; an `egress` line with `decision: "error"` for that origin; no denial. For subresources, `failed_requests` shows `status` `502`/`504` over plain HTTP, or a `net::ERR_*` token over HTTPS. Over HTTPS a refusal looks the same to Chromium; `blocked_requests` and the `egress` line tell them apart. |
+| DNS or connection problem | `error.code` `dns_resolution_failed`, `dns_no_answer`, `dns_timeout`, `connection_failed` or `connect_timeout`; an `egress` line with `decision: "error"` for that origin; no denial. For subresources, `failed_requests` shows `status` `502`/`504` over plain HTTP, or a `net::ERR_*` token over HTTPS. Over HTTPS a refusal looks the same to Chromium; `blocked_requests` and the `egress` line tell them apart. |
 | Connection dropped by the destination | `upstream_error` as `error.code` or in an `egress` line. Over HTTPS only a drop before the destination sent anything is visible. |
 | TLS failure | `policy_denied` / `tls_verification_failed`, with a `net_error` such as `net::ERR_CERT_AUTHORITY_INVALID`. The proxy does not see TLS; it logs the tunnel as allowed. |
 | HTTP error from the destination | `browser.navigate` succeeds with `http_status` ≥ 400 (a challenge page, such as 401, 403, 429, 451 or a CAPTCHA, pauses the session instead, see the next row); failing subresources are in `failed_requests` with `status`. Over plain HTTP, a `502` or `504` carrying `x-research-browser-proxy-error` came from the proxy, not the destination. |
